@@ -19,8 +19,6 @@ import torch.nn.functional as F
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from imgaug import augmenters as iaa
-import albumentations as A
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
     resample_segments, clean_str
 from utils.torch_utils import torch_distributed_zero_first
@@ -59,7 +57,9 @@ def exif_size(img):
 
 
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', tidl_load=False, kpt_label=False):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', tidl_load=False, kpt_label=False, nkpt=7, flip_idx=None):
+    if quad and kpt_label:
+        raise ValueError('Quad collation does not support pose targets; omit --quad')
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -73,7 +73,7 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       image_weights=image_weights,
                                       prefix=prefix,
                                       tidl_load=tidl_load,
-                                      kpt_label=kpt_label)
+                                      kpt_label=kpt_label, nkpt=nkpt, flip_idx=flip_idx)
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
@@ -352,19 +352,27 @@ def img2label_paths(img_paths):
 
 class LoadImagesAndLabels(Dataset):  # for training/testing
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='',square=False, tidl_load=False, kpt_label=True):
+                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix='',square=False, tidl_load=False, kpt_label=True, nkpt=7, flip_idx=None):
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.rect=False
         self.tidl_load = tidl_load
         self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
         self.kpt_label = kpt_label
+        self.nkpt = int(nkpt)
+        if self.nkpt <= 0 and kpt_label:
+            raise ValueError('nkpt must be positive for pose labels')
+        default_flip = [0, 5, 4, 3, 2, 1, 6] if self.nkpt == 7 else list(range(self.nkpt))
+        self.flip_idx = list(default_flip if flip_idx is None else flip_idx)
+        if sorted(self.flip_idx) != list(range(self.nkpt)):
+            raise ValueError('flip_idx must be a keypoint-index permutation')
+        self.flip_index = list(range(5)) + [coordinate for point in self.flip_idx
+                                           for coordinate in (5 + 2 * point, 6 + 2 * point)]
         # self.flip_index = [0, 1, 2, 3, 4, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15, 18, 17]
 
         try:
@@ -399,8 +407,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
         if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
-            if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
+            cache, exists = torch.load(cache_path, weights_only=False), True  # trusted local label cache
+            if cache.get('hash') != get_hash(self.label_files + self.img_files) or cache.get('version') != 0.2 or cache.get('nkpt') != self.nkpt:  # changed
                 cache, exists = self.cache_labels(cache_path, prefix, self.kpt_label), False  # re-cache
         else:
             cache, exists = self.cache_labels(cache_path, prefix, self.kpt_label), False  # cache
@@ -415,6 +423,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         # Read cache
         cache.pop('hash')  # remove hash
         cache.pop('version')  # remove version
+        cache.pop('nkpt')  # remove pose-schema cache marker
         labels, shapes, self.segments = zip(*cache.values())
         self.labels = list(labels)
         self.shapes = np.array(shapes, dtype=np.float64)
@@ -453,9 +462,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 elif mini > 1:
                     shapes[i] = [1, 1 / mini]
             if not tidl_load:
-                self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+                self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int_) * stride
             else:
-                self.batch_shapes = (np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
+                self.batch_shapes = (np.array(shapes) * img_size / stride + pad).astype(np.int_) * stride
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
         if cache_images:
@@ -497,16 +506,21 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     if len(l):
                         assert (l >= 0).all(), 'negative labels'
                         if kpt_label:
-                            assert l.shape[1] == 26, 'labels require 26 columns each'
-                            assert (l[:, 5::3] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
-                            assert (l[:, 6::3] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
-                            # print("l shape", l.shape)
-                            kpts = np.zeros((l.shape[0], 19))
-                            for i in range(len(l)):
-                                kpt = np.delete(l[i,5:], np.arange(2, l.shape[1]-5, 3))  #remove the occlusion paramater from the GT
-                                kpts[i] = np.hstack((l[i, :5], kpt))
-                            l = kpts
-                            assert l.shape[1] == 19, 'labels require 39 columns each after removing occlusion paramater'
+                            assert l.shape[1] == 5 + 3 * self.nkpt, f'pose labels require {5 + 3 * self.nkpt} columns'
+                            assert np.isfinite(l).all(), 'nonfinite labels'
+                            assert (l[:, 1:5] <= 1).all(), 'non-normalized box coordinates'
+                            triplets = l[:, 5:].reshape(-1, self.nkpt, 3)
+                            assert (triplets[:, :, :2] <= 1).all(), 'non-normalized keypoint coordinates'
+                            assert np.isin(triplets[:, :, 2], [0, 1, 2]).all(), 'visibility must be 0, 1 or 2'
+                            # The legacy network trains x/y plus a labelled/unlabelled mask.
+                            # Mask v=0 explicitly; v=1 occluded-but-labelled points remain targets.
+                            xy = triplets[:, :, :2].copy()
+                            xy[triplets[:, :, 2] == 0] = 0
+                            # Zero is the legacy internal missing-coordinate sentinel.
+                            # Keep annotated points at an exact image edge distinguishable.
+                            visible = triplets[:, :, 2] > 0
+                            xy[visible] = np.maximum(xy[visible], 1e-6)
+                            l = np.concatenate((l[:, :5], xy.reshape(-1, 2 * self.nkpt)), axis=1)
                         else:
                             assert l.shape[1] == 5, 'labels require 5 columns each'
                             assert (l[:, 1:5] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
@@ -515,11 +529,11 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     else:
                         ne += 1  # label empty
                         # print(lb_file)
-                        l = np.zeros((0, 7 *2 + 5), dtype=np.float32) if kpt_label else np.zeros((0, 5), dtype=np.float32)
+                        l = np.zeros((0, self.nkpt * 2 + 5), dtype=np.float32) if kpt_label else np.zeros((0, 5), dtype=np.float32)
 
                 else:
                     nm += 1  # label missing
-                    l = np.zeros((0, 7 *2 + 5), dtype=np.float32) if kpt_label else np.zeros((0, 5), dtype=np.float32)
+                    l = np.zeros((0, self.nkpt * 2 + 5), dtype=np.float32) if kpt_label else np.zeros((0, 5), dtype=np.float32)
 
                 x[im_file] = [l, shape, segments]
             except Exception as e:
@@ -535,7 +549,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = nf, nm, ne, nc, i + 1
-        x['version'] = 0.1  # cache version
+        x['version'] = 0.2  # cache version
+        x['nkpt'] = self.nkpt
         try:
             torch.save(x, path)  # save for next time
             logging.info(f'{prefix}New cache created: {path}')
@@ -627,7 +642,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
                     if self.kpt_label:
-                        labels[:, 6::2]= (1-labels[:, 6::2])*(labels[:, 6::2]!=0)
+                        labels[:, 6::2] = (1-labels[:, 6::2])*(labels[:, 6::2]!=0)
+                        labels = labels[:, self.flip_index]
 
             # flip left-right
             if random.random() < hyp['fliplr']:
@@ -739,12 +755,6 @@ def load_mosaic(self, index):
     s = self.img_size
     yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
     indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
-    seq = iaa.Sequential(
-        [iaa.arithmetic.CoarseDropout(p=(0.01, 0.05), size_percent=0.3),
-         iaa.arithmetic.SaltAndPepper(p=(0.004, 0.02)),
-         iaa.blur.GaussianBlur(sigma=(0.001, 0.5))
-         ]
-    )
     # v = random.uniform(0, 255)
     # transform = A.Compose([
     #     A.GaussianBlur(p=0.8),
@@ -1011,7 +1021,7 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
             # new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
             # new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
             if kpt_label:
-                kps = 7
+                kps = (targets.shape[1] - 5) // 2
                 xy_kpts = np.ones((n * kps, 3))
                 xy_kpts[:, :2] = targets[:,5:].reshape(n*kps, 2)  #num_kpt is hardcoded to 17
                 xy_kpts = xy_kpts @ M.T # transform
@@ -1020,8 +1030,9 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
                 x_kpts = xy_kpts[:, list(range(0,kps*2,2))]
                 y_kpts = xy_kpts[:, list(range(1,kps*2,2))]
 
-                x_kpts[np.logical_or.reduce((x_kpts < 0, x_kpts > width, y_kpts < 0, y_kpts > height))] = 0
-                y_kpts[np.logical_or.reduce((x_kpts < 0, x_kpts > width, y_kpts < 0, y_kpts > height))] = 0
+                outside = np.logical_or.reduce((x_kpts < 0, x_kpts > width, y_kpts < 0, y_kpts > height))
+                x_kpts[outside] = 0
+                y_kpts[outside] = 0
                 xy_kpts[:, list(range(0, kps*2, 2))] = x_kpts
                 xy_kpts[:, list(range(1, kps*2, 2))] = y_kpts
 
@@ -1143,7 +1154,7 @@ def extract_boxes(path='../coco128/'):  # from utils.datasets import *; extract_
                     b = x[1:] * [w, h, w, h]  # box
                     # b[2:] = b[2:].max()  # rectangle to square
                     b[2:] = b[2:] * 1.2 + 3  # pad
-                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int)
+                    b = xywh2xyxy(b.reshape(-1, 4)).ravel().astype(np.int_)
 
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)

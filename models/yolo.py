@@ -30,7 +30,7 @@ class Detect(nn.Module):
     def __init__(self, nc=80, anchors=(), nkpt=None, ch=(), inplace=True, dw_conv_kpt=False):  # detection layer
         super(Detect, self).__init__()
         self.nc = nc  # number of classes
-        self.nkpt = nkpt
+        self.nkpt = int(nkpt or 0)
         self.dw_conv_kpt = dw_conv_kpt
         self.no_det=(nc + 5)  # number of outputs per anchor for box and class
         self.no_kpt = 3*self.nkpt ## number of outputs per anchor for keypoints
@@ -47,7 +47,7 @@ class Detect(nn.Module):
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
         self.m = nn.ModuleList(nn.Conv2d(x, self.no_det * self.na, 1) for x in ch)  # output conv 对每个输出的feature map都要调用一次conv1x1
 
-        if self.nkpt is not None:
+        if self.nkpt:
             if self.dw_conv_kpt: #keypoint head is slightly more complex
 
                 self.m_kpt = nn.ModuleList(
@@ -68,57 +68,38 @@ class Detect(nn.Module):
         self.inplace = inplace  # use in-place ops (e.g. slice assignment)
 
     def forward(self, x):
-
-
-        # x = x.copy()  # for profiling
-        z = []  # inference output
+        z = []
         self.training |= self.export
         for i in range(self.nl):
-            if self.nkpt is None or self.nkpt==0:
-
-                x[i] = self.m[i](x[i])
+            features = x[i]
+            bs, _, ny, nx = features.shape
+            detection = self.m[i](features).view(bs, self.na, self.no_det, ny, nx)
+            if self.nkpt:
+                keypoints = self.m_kpt[i](features).view(bs, self.na, self.no_kpt, ny, nx)
+                # Group each anchor's box and landmarks together. Concatenating
+                # flat branch channels before this reshape mixes anchors.
+                output = torch.cat((detection, keypoints), dim=2)
             else:
-                x[i] = torch.cat((self.m[i](x[i]), self.m_kpt[i](x[i])), axis=1)
-
-            bs, _, ny, nx = x[i].shape  # x(bs,81,20,20) to x(bs,3,20,20,27)
-            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
-            x_det = x[i][..., :6]
-            x_kpt = x[i][..., 6:]
-
-            if not self.training:  # inference
+                output = detection
+            x[i] = output.permute(0, 1, 3, 4, 2).contiguous()
+            if not self.training:
                 if self.grid[i].shape[2:4] != x[i].shape[2:4]:
                     self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
-                kpt_grid_x = self.grid[i][..., 0:1]
-                kpt_grid_y = self.grid[i][..., 1:2]
-
-                if self.nkpt == 0:
-                    y = x[i].sigmoid()
-                else:
-                    y = x_det.sigmoid()
-                if self.inplace:
-                    xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i].view(1, self.na, 1, 1, 2) # wh
-                    if self.nkpt != 0:
-                        x_kpt[..., 0::3] = (x_kpt[..., ::3] + kpt_grid_x.repeat(1,1,1,1,7)) * self.stride[i]  # xy
-                        x_kpt[..., 1::3] = (x_kpt[..., 1::3] + kpt_grid_y.repeat(1,1,1,1,7)) * self.stride[i]  # xy
-                        x_kpt[..., 2::3] = x_kpt[..., 2::3]
-
-                    y = torch.cat((xy, wh, y[..., 4:], x_kpt), dim=-1)
-
-                else:  # for YOLOv5 on AWS Inferentia
-                    xy = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]  # xy
-                    wh = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
-                    if self.nkpt != 0:
-                        y[..., 6:] = (y[..., 6:] + self.grid[i].repeat((1,1,1,1,self.nkpt))) * self.stride[i]  # xy
-                    y = torch.cat((xy, wh, y[..., 4:]), -1)
-
-                z.append(y.view(bs, -1, self.no))
-
+                det = x[i][..., :self.no_det].sigmoid()
+                xy = (det[..., :2] * 2 - 0.5 + self.grid[i]) * self.stride[i]
+                wh = (det[..., 2:4] * 2) ** 2 * self.anchor_grid[i].view(1, self.na, 1, 1, 2)
+                parts = [xy, wh, det[..., 4:]]
+                if self.nkpt:
+                    keypoints = x[i][..., self.no_det:].view(bs, self.na, ny, nx, self.nkpt, 3)
+                    locations = (keypoints[..., :2] + self.grid[i].unsqueeze(-2)) * self.stride[i]
+                    confidence = keypoints[..., 2:3].sigmoid()
+                    parts.append(torch.cat((locations, confidence), -1).flatten(-2))
+                z.append(torch.cat(parts, -1).view(bs, -1, self.no))
         return x if self.training else (torch.cat(z, 1), x)
 
     @staticmethod
     def _make_grid(nx=20, ny=20):
-        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        yv, xv = torch.meshgrid(torch.arange(ny), torch.arange(nx), indexing="ij")
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
 
@@ -132,6 +113,9 @@ class Model(nn.Module):
             self.yaml_file = Path(cfg).name
             with open(cfg) as f:
                 self.yaml = yaml.safe_load(f)  # model dict
+
+        # This implementation groups detection/keypoint channels per anchor.
+        self.yaml['pose_anchor_layout'] = 'per_anchor'
 
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
@@ -222,6 +206,21 @@ class Model(nn.Module):
             elif flips == 3:
                 x = img_size[1] - x  # de-flip lr
             p = torch.cat((x, y, wh, p[..., 4:]), -1)
+        nkpt = self.model[-1].nkpt
+        if nkpt:
+            start = self.model[-1].no_det
+            points = p[..., start:].reshape(*p.shape[:-1], nkpt, 3).clone()
+            points[..., :2] /= scale
+            if flips == 2:
+                points[..., 1] = img_size[0] - points[..., 1]
+            elif flips == 3:
+                points[..., 0] = img_size[1] - points[..., 0]
+            if flips in (2, 3):
+                flip_idx = self.yaml.get('flip_idx')
+                if flip_idx is None:
+                    raise ValueError('Pose augmented flip inference requires flip_idx')
+                points = points[..., flip_idx, :]
+            p[..., start:] = points.flatten(-2)
         return p
 
     def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
@@ -284,7 +283,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
     logger.info('\n%3s%18s%3s%10s  %-40s%-30s' % ('', 'from', 'n', 'params', 'module', 'arguments'))
     anchors, nc, nkpt, gd, gw = d['anchors'], d['nc'], d['nkpt'], d['depth_multiple'], d['width_multiple']
     na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5 + 2*nkpt)   # number of outputs = anchors * (classes + 5)
+    no = na * (nc + 5 + 3*nkpt)   # number of outputs = anchors * (classes + 5)
 
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args

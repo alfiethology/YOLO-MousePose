@@ -105,7 +105,6 @@ class ComputeLoss:
         BCE_kptv = nn.BCEWithLogitsLoss(pos_weight=torch.tensor([h['obj_pw']], device=device))
         # Class label smoothing https://arxiv.org/pdf/1902.04103.pdf eqn 3
         self.cp, self.cn = smooth_BCE(eps=h.get('label_smoothing', 0.0))  # positive, negative BCE targets
-        self.sigmas = [.056, .052, .061, .058, .061, .052, .032, ]
         # Focal loss
         g = h['fl_gamma']  # focal loss gamma
         if g > 0:
@@ -116,15 +115,20 @@ class ComputeLoss:
         self.ssi = list(det.stride).index(16) if autobalance else 0  # stride 16 index
         self.stride = det.stride.to(device)
         self.BCEcls, self.BCEobj, self.gr, self.hyp, self.autobalance = BCEcls, BCEobj, model.gr, h, autobalance
+        self.BCEkpt = BCE_kptv
         for k in 'na', 'nc', 'nl', 'anchors', 'nkpt':
             setattr(self, k, getattr(det, k))
+        config = (model.module if is_parallel(model) else model).yaml
+        sigmas = h.get('kpt_oks_sigmas', config.get('kpt_oks_sigmas'))
+        if sigmas is None:
+            sigmas = [1.0 / self.nkpt] * self.nkpt if self.nkpt else []
+        if len(sigmas) != self.nkpt or any(not np.isfinite(v) or v <= 0 for v in sigmas):
+            raise ValueError('kpt_oks_sigmas must have one positive finite value per keypoint')
+        self.sigmas = torch.as_tensor(sigmas, device=device, dtype=torch.float32)
 
     def __call__(self, p, targets, training):  # predictions, targets, model
-        if training:
-            print()
-
         device = targets.device
-        nkpt = 7
+        nkpt = self.nkpt
         lcls, lbox, lobj, lkpt, lkptv = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
 
         tcls, tbox, tkpt, indices, anchors, xyi = self.build_targets(p, targets)  # targets
@@ -138,8 +142,8 @@ class ComputeLoss:
             if n:
                 ps = pi[b, a, gj, gi]  # prediction subset corresponding to targets
 
-                if torch.sum(torch.isnan(ps)) > 0 or torch.sum(torch.isinf(ps)) > 0:
-                    input()
+                if not torch.isfinite(ps).all():
+                    raise FloatingPointError("Nonfinite pose predictions encountered")
                 # Regression
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
@@ -147,41 +151,25 @@ class ComputeLoss:
                 iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
                 lbox += (1.0 - iou).mean()  # iou loss
                 if self.kpt_label:
-                    # Direct kpt prediction
-                    pkpt_x = ps[:, 6::3]
-                    pkpt_y = ps[:, 7::3]
-                    pkpt_score = ps[:, 8::3].sigmoid()
-                    # mask
-                    kpt_mask = xyi[i]
-                    lkptv += self.BCEcls(pkpt_score, xyi[i].float())
-                    # l2 distance based loss
-                    # lkpt += (((pkpt - tkpt[i]) * kpt_mask) ** 2).mean()
-                    # dist = torch.sqrt(((pkpt_x - tkpt[i][:, 0::2]) ** 2 + (pkpt_y - tkpt[i][:, 1::2]) ** 2) * kpt_mask)
-                    # d = torch.mean(torch.sqrt((((pkpt_x - tkpt[i][:, 0::2]) ** 2 + (pkpt_y - tkpt[i][:, 1::2]) ** 2) * kpt_mask)), dim=0)
-                    # lkpt +=loss
-                    # lkpt += (((pkpt_x - tkpt[i][:, 0::2]) ** 2 + (pkpt_y - tkpt[i][:, 1::2]) ** 2) * xyi[i]).mean()  #Try to make this loss based on distance instead of ordinary difference
-                    # lkpt += ((pkpt_length - tkpt[i][:, 2::3]) ** 2 * xyi[i]).mean()  #Try to make this loss based on distance instead of ordinary difference
-                    # oks based loss
-                    d = ((pkpt_x-tkpt[i][:, 0::2])**2 + (pkpt_y-tkpt[i][:, 1::2])**2) * kpt_mask
-                    # if not training:
-                    #     input()
-                    s = torch.prod(tbox[i][:, -2:], dim=1, keepdim=True)
-                    kpt_loss_factor = (torch.sum(kpt_mask != 0) + torch.sum(kpt_mask == 0))/(torch.sum(kpt_mask != 0) + 1e-8)
-                    # oks based loss
-                    # kl = torch.mean(
-                    #     (1 - torch.exp(-d / (s * (4 * torch.tensor(self.sigmas, device=device) ** 2) + 1e-9))), dim=0)
-                    # improved oks based loss
-                    kl = torch.mean((d / (s * (4 * torch.tensor(self.sigmas, device=device) ** 2))), dim=0)
-                    kl = kl.mean()
-                    lkpt +=kpt_loss_factor * kl
+                    # Confidence is a logit during training. Coordinates of
+                    # absent landmarks are excluded; annotated occluded points
+                    # remain coordinate-supervised, as with visible points.
+                    keypoints = ps[:, 5+self.nc:].reshape(-1, self.nkpt, 3)
+                    mask = xyi[i]
+                    lkptv += self.BCEkpt(keypoints[..., 2], mask.float())
+                    expected = tkpt[i].reshape(-1, self.nkpt, 2)
+                    distance = (keypoints[..., :2] - expected).square().sum(-1)
+                    area = tbox[i][:, -2:].prod(-1, keepdim=True).clamp_min(1e-9)
+                    scaled = distance / (area * (4 * self.sigmas.square()))
+                    lkpt += (scaled * mask).sum() / mask.sum().clamp_min(1)
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
+                    t = torch.full_like(ps[:, 5:5+self.nc], self.cn, device=device)  # targets
                     t[range(n), tcls[i]] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += self.BCEcls(ps[:, 5:5+self.nc], t)  # BCE
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
                 #     [file.write('%11.5g ' * 4 % tuple(x) + '\n') for x in torch.cat((txy[i], twh[i]), 1)]
@@ -207,7 +195,7 @@ class ComputeLoss:
         # Build targets for compute_loss(), input targets(image,class,x,y,w,h)
         na, nt = self.na, targets.shape[0]  # number of anchors, targets
 
-        nkpt = 7
+        nkpt = self.nkpt
         tcls, tbox, tkpt, indices, anch = [], [], [], [], []
         if self.kpt_label:
             gain = torch.ones(7 + 2 * nkpt, device=targets.device)  # normalized to gridspace gain
@@ -266,13 +254,15 @@ class ComputeLoss:
                 for kpt in range(nkpt):
                     xi = t[:, 6+2*kpt] != 0
                     yi = t[:, 6+2*kpt + 1] != 0
-                    xyi = torch.bitwise_and(xi, yi)
+                    # A landmark on x=0 or y=0 is still valid; only the
+                    # absent (0, 0) pair is masked in the internal XY format.
+                    xyi = torch.bitwise_or(xi, yi)
                     xyis.append(xyi)
                     t[xyi, 6+2*kpt: 6+2*(kpt+1)] -= gij[xyi]
                 tkpt.append(t[:, 6:-1])
             anch.append(anchors[a])  # anchors
             tcls.append(c)  # class
-            xyiss.append(torch.stack(xyis, dim=1))
+            xyiss.append(torch.stack(xyis, dim=1) if xyis else torch.empty((len(t), 0), dtype=torch.bool, device=t.device))
         return tcls, tbox, tkpt, indices, anch, xyiss
 
 #

@@ -4,6 +4,8 @@ import math
 import os
 import random
 import time
+import json
+import csv
 from copy import deepcopy
 from pathlib import Path
 from threading import Thread
@@ -18,12 +20,16 @@ import torch.utils.data
 import yaml
 from torch.cuda import amp
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    SummaryWriter = None
 from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
 from models.experimental import attempt_load
 from models.yolo import Model
+from utils.pose_transfer import transfer_pose_weights
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
@@ -36,6 +42,14 @@ from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_di
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 
 logger = logging.getLogger(__name__)
+
+
+def atomic_checkpoint(checkpoint, path):
+    """Publish a complete checkpoint rather than exposing a partially written file."""
+    path = Path(path)
+    temporary = path.with_name(path.name + '.tmp')
+    torch.save(checkpoint, temporary)
+    os.replace(temporary, path)
 
 
 def train(hyp, opt, device, tb_writer=None):
@@ -63,13 +77,17 @@ def train(hyp, opt, device, tb_writer=None):
     init_seeds(2 + rank)
     with open(opt.data) as f:
         data_dict = yaml.safe_load(f)  # data dict
+    if data_dict.get('review_required') and not opt.allow_incomplete_review:
+        raise ValueError('Pose annotations still require full-frame completeness review. '
+                         'Review the exported dataset README before training; use '
+                         '--allow-incomplete-review only for an acknowledged experiment.')
     is_coco = opt.data.endswith('coco.yaml')
 
     # Logging- Doing this before checking the dataset. Might update data_dict
     loggers = {'wandb': None}  # loggers dict
     if rank in [-1, 0]:
         opt.hyp = hyp  # add hyperparameters
-        run_id = torch.load(weights).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
+        run_id = torch.load(weights, map_location='cpu', weights_only=False).get('wandb_id') if weights.endswith('.pt') and os.path.isfile(weights) else None
         wandb_logger = WandbLogger(opt, save_dir.stem, run_id, data_dict)
         loggers['wandb'] = wandb_logger.wandb
         data_dict = wandb_logger.data_dict
@@ -82,25 +100,27 @@ def train(hyp, opt, device, tb_writer=None):
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
-    pretrained = weights.endswith('.pt') or weights.endswith('.pth')
-
+    pretrained = bool(weights) and weights.endswith(('.pt', '.pth'))
+    ckpt = None
     if pretrained:
-        with torch_distributed_zero_first(rank):
-            attempt_download(weights)  # download if not found locally
-        ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
-        # ms = model.state_dict()
-        exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
-        state_dict = ckpt['model']  # to FP32
-        if weights.endswith('.pt'):
-            model_to_save = ckpt['model'].module if hasattr(ckpt['model'], 'module') else ckpt['model']
-            state_dict = model_to_save.state_dict()
-        # state_dict = intersect_dicts(state_dict.state_dict(), model.state_dict(), exclude=exclude)  # intersect
-        state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
-    else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        if not Path(weights).is_file():
+            raise FileNotFoundError(f'Checkpoint not found: {weights}. No automatic download is attempted.')
+        ckpt = torch.load(weights, map_location='cpu', weights_only=False)
+    checkpoint_model = ckpt.get('ema') if ckpt and ckpt.get('ema') is not None else ckpt.get('model') if ckpt else None
+    cfg = opt.cfg or getattr(checkpoint_model, 'yaml', None)
+    if cfg is None:
+        raise ValueError('A model YAML is required for backbone/state-dict weights')
+    model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)
+    nkpt = int(model.yaml['nkpt'])
+    if kpt_label and int(data_dict.get('nkpt', data_dict.get('kpt_shape', [nkpt])[0])) != nkpt:
+        raise ValueError('Dataset and model keypoint counts differ')
+    for key in ('kpt_names', 'keypoint_names', 'flip_idx', 'skeleton', 'kpt_oks_sigmas'):
+        if key in data_dict:
+            model.yaml[key] = data_dict[key]
+    if pretrained:
+        transfer = transfer_pose_weights(model, ckpt)
+        (save_dir / 'weight_transfer.json').write_text(json.dumps(transfer, indent=2) + '\n')
+        logger.info('Weight transfer: %s', transfer)
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -154,11 +174,9 @@ def train(hyp, opt, device, tb_writer=None):
     # Resume
     start_epoch, best_fitness = 0, 0.0
 
-    if weights.endswith('.pth'):
-        pretrained = False
-    if pretrained:
+    if opt.resume and ckpt is not None:
         # Optimizer
-        if ckpt['optimizer'] is not None:
+        if ckpt.get('optimizer') is not None:
             optimizer.load_state_dict(ckpt['optimizer'])
             best_fitness = ckpt['best_fitness']
 
@@ -180,7 +198,7 @@ def train(hyp, opt, device, tb_writer=None):
                         (weights, ckpt['epoch'], epochs))
             epochs += ckpt['epoch']  # finetune additional epochs
 
-        del ckpt, state_dict
+    del ckpt
 
     # Image sizes
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
@@ -201,7 +219,7 @@ def train(hyp, opt, device, tb_writer=None):
                                             hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
                                             world_size=opt.world_size, workers=opt.workers,
                                             image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
-                                            kpt_label=kpt_label)
+                                            kpt_label=kpt_label, nkpt=nkpt, flip_idx=model.yaml.get('flip_idx'))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
@@ -211,7 +229,8 @@ def train(hyp, opt, device, tb_writer=None):
         testloader = create_dataloader(test_path, imgsz_test, test_batch_size, gs, opt,  # testloader
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
                                        world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '), kpt_label=kpt_label)[0]
+                                       pad=0.5, prefix=colorstr('val: '), kpt_label=kpt_label,
+                                       nkpt=nkpt, flip_idx=model.yaml.get('flip_idx'))[0]
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -247,10 +266,10 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Start training
     t0 = time.time()
-    nw = max(round(hyp['warmup_epochs'] * nb), 1000)  # number of warmup iterations, max(3 epochs, 1k iterations)
+    nw = max(round(hyp['warmup_epochs'] * nb), 1)  # honour configured warmup on this small dataset
     # nw = min(nw, (epochs - start_epoch) / 2 * nb)  # limit warmup to < 1/2 of training
     maps = np.zeros(nc)  # mAP per class
-    results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
+    results = tuple([0.] * (22 + nkpt))
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss = ComputeLoss(model, kpt_label=kpt_label)  # init loss class
@@ -368,7 +387,7 @@ def train(hyp, opt, device, tb_writer=None):
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                if (epoch == 0) or ((epoch + 1) % 5 == 0):
+                if (epoch == 0) or ((epoch + 1) % opt.val_period == 0) or final_epoch:
                     # if(epoch==0) or test_counter == 20:
                     results, maps, times = test.test(data_dict,
                                                      batch_size=test_batch_size,
@@ -388,7 +407,7 @@ def train(hyp, opt, device, tb_writer=None):
                     # Write
                     with open(results_file, 'a') as f:
 
-                        f.write(s + '%10.4g' * 29 % results + '\n') # append metrics, val_loss
+                        f.write(s + '%10.4g' * len(results) % results + '\n')
                     if len(opt.name) and opt.bucket:
                         os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
                     ckpt = {'epoch': epoch,
@@ -401,25 +420,42 @@ def train(hyp, opt, device, tb_writer=None):
                             'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
                     rang = wdir / f'epoch{epoch}.pt'
                     if epoch > 300:
-                      torch.save(ckpt, rang)
+                      atomic_checkpoint(ckpt, rang)
 
 
             # Log
-            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss', 'train/tkpt_loss', 'train/tkptv_loss',
-                    # train loss
-                    'metrics/precision', 'metrics/recall', 'metrics/mAP_0.5', 'metrics/mAP_0.5:0.95', 'metrics/mse',
-                    'val/box_loss', 'val/obj_loss', 'val/cls_loss', 'val/tkpt_loss', 'val/tkptv_loss',  # val loss
-                    'x/lr0', 'x/lr1', 'x/lr2']  # params
+            keypoint_names = model.yaml.get('kpt_names', [str(i) for i in range(nkpt)])
+            tags = ['train/box_loss', 'train/obj_loss', 'train/cls_loss', 'train/kpt_loss', 'train/kpt_conf_loss',
+                    'val/box_precision', 'val/box_recall', 'val/box_map50', 'val/box_map75',
+                    'val/box_map90', 'val/box_map50_95', 'val/matched_keypoint_error_px',
+                    *[f'val/pck_{name}_0.1' for name in keypoint_names],
+                    *[f'val/pck_diag_{threshold:.2f}' for threshold in np.arange(0.02, 0.21, 0.02)],
+                    'val/box_loss', 'val/obj_loss', 'val/cls_loss', 'val/kpt_loss', 'val/kpt_conf_loss',
+                    'lr/pg0', 'lr/pg1', 'lr/pg2']
+            values = [float(value) for value in list(mloss[:-1]) + list(results) + lr]
+            assert len(tags) == len(values), 'Validation result schema differs from training log schema'
+            validated = (not opt.notest or final_epoch) and ((epoch == 0) or ((epoch + 1) % opt.val_period == 0) or final_epoch)
+            if validated:
+                metrics_file = save_dir / 'metrics.csv'
+                new_file = not metrics_file.exists()
+                with metrics_file.open('a', newline='') as handle:
+                    writer = csv.writer(handle)
+                    if new_file:
+                        writer.writerow(['epoch', *tags])
+                    writer.writerow([epoch + 1, *values])
 
-            for x, tag in zip(list(mloss[:-1]) + list(results) + lr, tags):
+            for x, tag in zip(values, tags):
                 if tb_writer:
                     tb_writer.add_scalar(tag, x, epoch)  # tensorboard
                 if wandb_logger.wandb:
                     wandb_logger.log({tag: x})  # W&B
 
             # Update best mAP
-            fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            if fi > best_fitness:
+            validated = not opt.notest or final_epoch
+            validated = validated and ((epoch == 0) or ((epoch + 1) % opt.val_period == 0) or final_epoch)
+            fi = float(results[7 + nkpt + 4] if kpt_label and opt.best_metric == 'pck' else results[5])
+            improved = validated and (not best.exists() or fi > best_fitness)
+            if improved:
                 best_fitness = fi
             wandb_logger.end_epoch(best_result=best_fitness == fi)
 
@@ -427,6 +463,7 @@ def train(hyp, opt, device, tb_writer=None):
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
                 ckpt = {'epoch': epoch,
                         'best_fitness': best_fitness,
+                        'best_metric': opt.best_metric,
                         'training_results': results_file.read_text(),
                         'model': deepcopy(model.module if is_parallel(model) else model).half(),
                         'ema': deepcopy(ema.ema).half(),
@@ -435,9 +472,9 @@ def train(hyp, opt, device, tb_writer=None):
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
 
                 # Save last, best and delete
-                torch.save(ckpt, last)
-                if best_fitness == fi:
-                    torch.save(ckpt, best)
+                atomic_checkpoint(ckpt, last)
+                if improved:
+                    atomic_checkpoint(ckpt, best)
                 if wandb_logger.wandb:
                     if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
                         wandb_logger.log_model(
@@ -493,9 +530,9 @@ def train(hyp, opt, device, tb_writer=None):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='weights/yolobackbone.pth', help='initial weights path')
-    parser.add_argument('--cfg', type=str, default='YOLO-MousePose-S.yaml', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/coco128.yaml', help='data.yaml path')
-    parser.add_argument('--hyp', type=str, default='data/hyp.scratch.yaml', help='hyperparameters path')
+    parser.add_argument('--cfg', type=str, default='models/hub/YOLO-RatPose-T.yaml', help='model.yaml path')
+    parser.add_argument('--data', type=str, default='data/rat_kpts.yaml', help='data.yaml path')
+    parser.add_argument('--hyp', type=str, default='data/hyp.rat.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
@@ -526,7 +563,10 @@ if __name__ == '__main__':
     parser.add_argument('--bbox_interval', type=int, default=-1, help='Set bounding-box image logging interval for W&B')
     parser.add_argument('--save_period', type=int, default=-1, help='Log model after every "save_period" epoch')
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
-    parser.add_argument('--kpt-label', action='store_true', help='use keypoint labels for training')
+    parser.add_argument('--kpt-label', action=argparse.BooleanOptionalAction, default=True, help='use keypoint labels for training')
+    parser.add_argument('--allow-incomplete-review', action='store_true', help='acknowledge candidate data still require completeness review')
+    parser.add_argument('--val-period', type=int, default=1, help='validate every N epochs and always on final epoch')
+    parser.add_argument('--best-metric', choices=['pck', 'bbox_map'], default='pck', help='select best checkpoint by pose PCK@0.1 or box AP50:95')
     opt = parser.parse_args()
 
     # Set DDP variables
@@ -534,8 +574,8 @@ if __name__ == '__main__':
     opt.global_rank = int(os.environ['RANK']) if 'RANK' in os.environ else -1
     set_logging(opt.global_rank)
     if opt.global_rank in [-1, 0]:
-        check_git_status()
-        check_requirements(exclude=('pycocotools', 'thop'))
+        if opt.val_period < 1:
+            parser.error('--val-period must be positive')
 
     # Resume
     wandb_run = check_wandb_resume(opt)
@@ -580,7 +620,7 @@ if __name__ == '__main__':
         if opt.global_rank in [-1, 0]:
             prefix = colorstr('tensorboard: ')
             logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
-            tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
+            tb_writer = SummaryWriter(opt.save_dir) if SummaryWriter else None
         train(hyp, opt, device, tb_writer)
 
     # Evolve hyperparameters (optional)

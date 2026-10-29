@@ -35,12 +35,15 @@ def detect(opt):
     # Load model
     model = attempt_load(weights, map_location=device)  # load FP32 model
     stride = int(model.stride.max())  # model stride
-    if isinstance(imgsz, (list,tuple)):
-        assert len(imgsz) ==2; "height and width of image has to be specified"
-        imgsz[0] = check_img_size(imgsz[0], s=stride)
-        imgsz[1] = check_img_size(imgsz[1], s=stride)
-    else:
-        imgsz = check_img_size(imgsz, s=stride)  # check img_size
+    if isinstance(imgsz, int):
+        imgsz = [imgsz, imgsz]
+    elif len(imgsz) == 1:
+        imgsz = list(imgsz) * 2
+    elif len(imgsz) != 2:
+        raise ValueError('--img-size takes one size or height and width')
+    imgsz = [check_img_size(size, s=stride) for size in imgsz]
+    nkpt = int(getattr(model.model[-1], 'nkpt', 0) or 0)
+    skeleton = model.yaml.get('skeleton')
     names = model.module.names if hasattr(model, 'module') else model.names  # get class names
     if half:
         model.half()  # to FP16
@@ -74,9 +77,10 @@ def detect(opt):
         # Inference
         t1 = time_synchronized()
         pred = model(img, augment=opt.augment)[0]
-        print(pred[...,4].max())
+        if not kpt_label:
+            pred = pred[..., :5+len(names)]
         # Apply NMS
-        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms, kpt_label=kpt_label)
+        pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms, kpt_label=kpt_label, nc=len(names), nkpt=nkpt if kpt_label else 0)
         t2 = time_synchronized()
 
         # Apply Classifier
@@ -98,8 +102,8 @@ def detect(opt):
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 scale_coords(img.shape[2:], det[:, :4], im0.shape, kpt_label=False)
-                print(det.shape)
-                scale_coords(img.shape[2:], det[:, 6:], im0.shape, kpt_label=kpt_label, step=3)
+                if kpt_label:
+                    scale_coords(img.shape[2:], det[:, 6:], im0.shape, kpt_label=True, step=3)
 
                 # Print results
                 for c in det[:, 5].unique():
@@ -107,24 +111,32 @@ def detect(opt):
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
-                for det_index, (*xyxy, conf, cls) in enumerate(reversed(det[:,:6])):
+                for row in reversed(det):
+                    xyxy, conf, cls = row[:4], row[4], row[5]
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                        line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
+                        line = [float(cls), *xywh]
+                        if kpt_label:
+                            points = row[6:].reshape(nkpt, 3).clone()
+                            points[:, 0] /= im0.shape[1]
+                            points[:, 1] /= im0.shape[0]
+                            line.extend(points.flatten().tolist())
+                        if opt.save_conf:
+                            line.append(float(conf))
                         with open(txt_path + '.txt', 'a') as f:
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
                     if save_img or opt.save_crop or view_img:  # Add bbox to image
                         c = int(cls)  # integer class
                         label = None if opt.hide_labels else (names[c] if opt.hide_conf else f'{names[c]} {conf:.2f}')
-                        kpts = det[det_index, 6:]
-                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=opt.line_thickness, kpt_label=kpt_label, kpts=kpts, steps=3, orig_shape=im0.shape[:2])
+                        kpts = row[6:]
+                        plot_one_box(xyxy, im0, label=label, color=colors(c, True), line_thickness=opt.line_thickness, kpt_label=kpt_label, kpts=kpts, steps=3, orig_shape=im0.shape[:2], skeleton=skeleton)
                         if opt.save_crop:
                             save_one_box(xyxy, im0s, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
 
                 if save_txt_tidl:  # Write to file in tidl dump format
-                    for *xyxy, conf, cls in det_tidl:
+                    for *xyxy, conf, cls in det[:, :6]:
                         xyxy = torch.tensor(xyxy).view(-1).tolist()
                         line = (conf, cls,  *xyxy) if opt.save_conf else (cls, *xyxy)  # label format
                         with open(txt_path + '.txt', 'a') as f:
@@ -157,6 +169,8 @@ def detect(opt):
                         vid_writer = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer.write(im0)
 
+    if isinstance(vid_writer, cv2.VideoWriter):
+        vid_writer.release()
     if save_txt or save_txt_tidl or save_img:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt or save_txt_tidl else ''
         print(f"Results saved to {save_dir}{s}")
@@ -192,7 +206,7 @@ if __name__ == '__main__':
     parser.add_argument('--kpt-label', action='store_true', help='use keypoint labels')
     opt = parser.parse_args()
     print(opt)
-    check_requirements(exclude=('tensorboard', 'pycocotools', 'thop'))
+    # Dependencies are managed explicitly via requirements-rat.txt.
 
     with torch.no_grad():
         if opt.update:  # update all models (to fix SourceChangeWarning)

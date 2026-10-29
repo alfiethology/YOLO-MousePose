@@ -10,9 +10,10 @@ from . import general
 
 
 def fitness(x):
-    # Model fitness as a weighted combination of metrics
-    w = [0.0, 0.0, 0.6, 0.4]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
-    return (x[:, :4] * w).sum(1)
+    # Validation returns [P, R, AP50, AP75, AP90, AP50:95, ...].
+    # Legacy four-column callers retain the usual [P, R, AP50, AP50:95] layout.
+    last = 5 if x.shape[1] >= 6 else 3
+    return 0.6 * x[:, 2] + 0.4 * x[:, last]
 
 
 def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=()):
@@ -98,7 +99,8 @@ def compute_ap(recall, precision):
     method = 'interp'  # methods: 'continuous', 'interp'
     if method == 'interp':
         x = np.linspace(0, 1, 101)  # 101-point interp (COCO)
-        ap = np.trapz(np.interp(x, mrec, mpre), x)  # integrate
+        integrate = np.trapezoid if hasattr(np, 'trapezoid') else np.trapz
+        ap = integrate(np.interp(x, mrec, mpre), x)
     else:  # 'continuous'
         i = np.where(mrec[1:] != mrec[:-1])[0]  # points where x axis (recall) changes
         ap = np.sum((mrec[i + 1] - mrec[i]) * mpre[i + 1])  # area under curve

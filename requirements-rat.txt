@@ -1,0 +1,14 @@
+# Use the existing yolo-env; no need to replace its CUDA/PyTorch installation.
+# TensorBoard, thop, pycocotools and wandb are optional.
+torch>=2.0
+torchvision>=0.15
+numpy>=1.24
+opencv-python>=4.5
+Pillow>=9
+PyYAML>=6
+scipy>=1.10
+pandas>=1.5
+seaborn>=0.12
+matplotlib>=3.6
+tqdm>=4.64
+requests>=2.28

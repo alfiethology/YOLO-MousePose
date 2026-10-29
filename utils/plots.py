@@ -65,7 +65,7 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     return filtfilt(b, a, data)  # forward-backward filter
 
 
-def plot_one_box(x, im, color=None, label=None, line_thickness=3, kpt_label=False, kpts=None, steps=2, orig_shape=None):
+def plot_one_box(x, im, color=None, label=None, line_thickness=3, kpt_label=False, kpts=None, steps=2, orig_shape=None, skeleton=None):
     # Plots one bounding box on image 'im' using OpenCV
     assert im.data.contiguous, 'Image not contiguous. Apply np.ascontiguousarray(im) to plot_on_box() input image.'
     tl = line_thickness or round(0.002 * (im.shape[0] + im.shape[1]) / 2) + 1  # line/font thickness
@@ -81,47 +81,30 @@ def plot_one_box(x, im, color=None, label=None, line_thickness=3, kpt_label=Fals
             cv2.rectangle(im, c1, c2, color, -1, cv2.LINE_AA)  # filled
             cv2.putText(im, label, (c1[0], c1[1] - 2), 0, tl / 6, [225, 255, 255], thickness=tf//2, lineType=cv2.LINE_AA)
     if kpt_label:
-        plot_skeleton_kpts(im, kpts, steps, orig_shape=orig_shape)
+        plot_skeleton_kpts(im, kpts, steps, orig_shape=orig_shape, skeleton=skeleton)
 
 
-def plot_skeleton_kpts(im, kpts, steps, orig_shape=None):
-    #Plot the skeleton and keypointsfor coco datatset
-    palette = np.array([[255, 128, 0], [255, 153, 51], [255, 178, 102],
-                        [230, 230, 0], [255, 153, 255], [153, 204, 255],
-                        [255, 102, 255], [255, 51, 255], [102, 178, 255],
-                        [51, 153, 255]])
-
-    skeleton = [[0, 1], [0, 2], [0, 3], [0, 4], [0, 5], [0, 6]]
-
-    pose_limb_color = palette[[0, ] * 6]
-    pose_kpt_color = palette[[3, ] * 7]
-    radius = 2
-    num_kpts = len(kpts) // steps
-
-    for kid in range(num_kpts):
-        r, g, b = pose_kpt_color[kid]
-        x_coord, y_coord = kpts[steps * kid], kpts[steps * kid + 1]
-        if not (x_coord % 640 == 0 or y_coord % 640 == 0):
-            if steps == 3:
-                conf = kpts[steps * kid + 2]
-                if conf < 0.5:
-                    continue
-            cv2.circle(im, (int(x_coord), int(y_coord)), radius, (int(r), int(g), int(b)), -1)
-
-    for sk_id, sk in enumerate(skeleton):
-        r, g, b = pose_limb_color[sk_id]
-        pos1 = (int(kpts[(sk[0]-1)*steps]), int(kpts[(sk[0]-1)*steps+1]))
-        pos2 = (int(kpts[(sk[1]-1)*steps]), int(kpts[(sk[1]-1)*steps+1]))
-        if steps == 3:
-            conf1 = kpts[(sk[0]-1)*steps+2]
-            conf2 = kpts[(sk[1]-1)*steps+2]
-            if conf1<0.5 or conf2<0.5:
-                continue
-        if pos1[0]%640 == 0 or pos1[1]%640==0 or pos1[0]<0 or pos1[1]<0:
-            continue
-        if pos2[0] % 640 == 0 or pos2[1] % 640 == 0 or pos2[0]<0 or pos2[1]<0:
-            continue
-        cv2.line(im, pos1, pos2, (int(r), int(g), int(b)), thickness=1)
+def plot_skeleton_kpts(im, kpts, steps, orig_shape=None, skeleton=None):
+    """Draw zero-based edges and any number of keypoints in image coordinates."""
+    if kpts is None or not len(kpts):
+        return
+    if isinstance(kpts, torch.Tensor):
+        kpts = kpts.detach().cpu().numpy()
+    points = np.asarray(kpts).reshape(-1, steps)
+    if skeleton is None:
+        skeleton = ([[4, 3], [3, 1], [1, 0], [2, 0], [2, 3], [5, 4]]
+                    if len(points) == 6 else [[0, i] for i in range(1, len(points))])
+    h, w = im.shape[:2]
+    valid = np.isfinite(points[:, :2]).all(1) & (points[:, :2] != 0).any(1)
+    valid &= (points[:, 0] >= 0) & (points[:, 0] < w) & (points[:, 1] >= 0) & (points[:, 1] < h)
+    if steps == 3:
+        valid &= points[:, 2] >= 0.5
+    for index, point in enumerate(points):
+        if valid[index]:
+            cv2.circle(im, tuple(point[:2].astype(int)), 3, (0, 230, 230), -1)
+    for first, second in skeleton:
+        if 0 <= first < len(points) and 0 <= second < len(points) and valid[first] and valid[second]:
+            cv2.line(im, tuple(points[first, :2].astype(int)), tuple(points[second, :2].astype(int)), (0, 220, 0), 2)
 
 
 def plot_one_box_PIL(box, im, color=None, label=None, line_thickness=None):
@@ -170,7 +153,7 @@ def output_to_target(output):
     return np.array(targets)
 
 
-def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16, kpt_label=True, steps=2, orig_shape=None):
+def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max_size=640, max_subplots=16, kpt_label=True, steps=2, orig_shape=None, skeleton=None):
     # Plot image grid with labels
 
     if isinstance(images, torch.Tensor):
@@ -211,7 +194,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
             image_targets = targets[targets[:, 0] == i]
             boxes = xywh2xyxy(image_targets[:, 2:6]).T
             classes = image_targets[:, 1].astype('int')
-            labels = image_targets.shape[1] == 20 if kpt_label else image_targets.shape[1] == 6   # labels if no conf column
+            labels = steps == 2 if kpt_label else image_targets.shape[1] == 6   # labels if no conf column
             conf = None if labels else image_targets[:, 6]  # check for confidence presence (label vs pred)
             if kpt_label:
                 if conf is None:
@@ -237,8 +220,9 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
                 elif scale_factor < 1 :
                     kpts[list(range(0, len(kpts), steps))] *= scale_factor
                     kpts[list(range(1, len(kpts), steps))] *= scale_factor
-                kpts[list(range(0, len(kpts), steps))] += block_x
-                kpts[list(range(1, len(kpts), steps))] += block_y
+                valid = (kpts[0::steps] != 0) | (kpts[1::steps] != 0)
+                kpts[0::steps] += block_x * valid
+                kpts[1::steps] += block_y * valid
 
             for j, box in enumerate(boxes.T):
                 cls = int(classes[j])
@@ -247,7 +231,7 @@ def plot_images(images, targets, paths=None, fname='images.jpg', names=None, max
                 if labels or conf[j] > 0.1:  # 0.25 conf thresh
                     label = '%s' % cls if labels else '%s %.1f' % (cls, conf[j])
                     if kpt_label:
-                        plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl, kpt_label=kpt_label, kpts=kpts[:,j], steps=steps, orig_shape=orig_shape)
+                        plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl, kpt_label=kpt_label, kpts=kpts[:,j], steps=steps, orig_shape=orig_shape, skeleton=skeleton)
                     else:
                         plot_one_box(box, mosaic, label=label, color=color, line_thickness=tl, kpt_label=kpt_label, orig_shape=orig_shape)
                     #cv2.imwrite(Path(paths[i]).name.split('.')[0] + "_box_{}.".format(j) + Path(paths[i]).name.split('.')[1], mosaic[:,:,::-1]) # used for debugging the dataloader pipeline
@@ -481,36 +465,49 @@ def plot_results_overlay(start=0, stop=0):  # from utils.plots import *; plot_re
 
 
 def plot_results(start=0, stop=0, bucket='', id=(), labels=(), save_dir=''):
-    # Plot training 'results*.txt'. from utils.plots import *; plot_results(save_dir='runs/train/exp')
-    fig, ax = plt.subplots(2, 5, figsize=(12, 6), tight_layout=True)
-    ax = ax.ravel()
-    s = ['Box', 'Objectness', 'Classification', 'Precision', 'Recall',
-         'val Box', 'val Objectness', 'val Classification', 'mAP@0.5', 'mAP@0.5:0.95']
-    if bucket:
-        # files = ['https://storage.googleapis.com/%s/results%g.txt' % (bucket, x) for x in id]
-        files = ['results%g.txt' % x for x in id]
-        c = ('gsutil cp ' + '%s ' * len(files) + '.') % tuple('gs://%s/results%g.txt' % (bucket, x) for x in id)
-        os.system(c)
-    else:
-        files = list(Path(save_dir).glob('results*.txt'))
-    assert len(files), 'No results.txt files found in %s, nothing to plot.' % os.path.abspath(save_dir)
-    for fi, f in enumerate(files):
+    """Plot the dynamic pose validation layout written by train.py."""
+    csv_path = Path(save_dir)/'metrics.csv'
+    if csv_path.exists():
+        data = pd.read_csv(csv_path)
+        fields = [('train/box_loss', 'train box'), ('train/obj_loss', 'train objectness'),
+                  ('train/kpt_loss', 'train keypoint'), ('train/kpt_conf_loss', 'train keypoint confidence'),
+                  ('val/box_precision', 'BBox precision'), ('val/box_recall', 'BBox recall'),
+                  ('val/box_map50', 'BBox AP50'), ('val/box_map50_95', 'BBox AP50:95'),
+                  ('val/matched_keypoint_error_px', 'Matched keypoint error (px)'),
+                  ('val/pck_diag_0.10', 'PCK@0.1 (all labelled points)'),
+                  ('val/box_loss', 'val box'), ('val/kpt_loss', 'val keypoint')]
+        fig, axes = plt.subplots(3, 4, figsize=(15, 10), tight_layout=True)
+        data = data.iloc[start:stop or None]
+        for ax, (column, title) in zip(axes.flat, fields):
+            if column in data:
+                ax.plot(data['epoch'], data[column], marker='.')
+            ax.set_title(title)
+            ax.set_xlabel('Epoch')
+        fig.savefig(Path(save_dir)/'results.png', dpi=160)
+        plt.close(fig)
+        return
+    files = list(Path(save_dir).glob('results*.txt'))
+    if not files:
+        return
+    titles = ['train box', 'train objectness', 'train class', 'train keypoint',
+              'Precision', 'Recall', 'BBox AP50', 'BBox AP50:95',
+              'Keypoint error (px)', 'PCK@0.1', 'val box', 'val keypoint']
+    fig, axes = plt.subplots(3, 4, figsize=(15, 10), tight_layout=True)
+    for file_index, path in enumerate(files):
         try:
-            results = np.loadtxt(f, usecols=[2, 3, 4, 8, 9, 12, 13, 14, 10, 11], ndmin=2).T
-            n = results.shape[1]  # number of rows
-            x = range(start, min(stop, n) if stop else n)
-            for i in range(10):
-                y = results[i, x]
-                if i in [0, 1, 2, 5, 6, 7]:
-                    y[y == 0] = np.nan  # don't show zero loss values
-                    # y /= y[0]  # normalize
-                label = labels[fi] if len(labels) else f.stem
-                ax[i].plot(x, y, marker='.', label=label, linewidth=2, markersize=8)
-                ax[i].set_title(s[i])
-                # if i in [5, 6, 7]:  # share train and val loss y axes
-                #     ax[i].get_shared_y_axes().join(ax[i], ax[i - 5])
-        except Exception as e:
-            print('Warning: Plotting error for %s; %s' % (f, e))
-
-    ax[1].legend()
-    fig.savefig(Path(save_dir) / 'results.png', dpi=200)
+            # Epoch/GPU columns contain text; numeric metric columns start at 2.
+            metrics = np.loadtxt(path, usecols=range(2, len(path.read_text().splitlines()[0].split())), ndmin=2)
+            nkpt = metrics.shape[1] - 30  # 8 training-prefix values + 22+nkpt validation values
+            if nkpt < 1:
+                raise ValueError('Unrecognized pose results column layout')
+            columns = [0, 1, 2, 3, 8, 9, 10, 13, 14, 19+nkpt, -5, -2]
+            end = min(stop, len(metrics)) if stop else len(metrics)
+            epochs = range(start, end)
+            for ax, column, title in zip(axes.flat, columns, titles):
+                ax.plot(epochs, metrics[start:end, column], marker='.', label=labels[file_index] if labels else path.stem)
+                ax.set_title(title)
+        except Exception as error:
+            print(f'Warning: plotting {path}: {error}')
+    axes.flat[0].legend()
+    fig.savefig(Path(save_dir)/'results.png', dpi=160)
+    plt.close(fig)

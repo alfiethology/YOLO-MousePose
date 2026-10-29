@@ -1,8 +1,12 @@
+"""Detection and pose validation with one-to-one multi-animal matching.
+
+BBox AP and keypoint PCK are reported separately. Keypoint metrics use labelled
+points only; missed target animals count as incorrect for PCK, not as omissions.
+"""
 import argparse
 import json
 import os
 from pathlib import Path
-from threading import Thread
 
 import numpy as np
 import torch
@@ -11,431 +15,229 @@ from tqdm import tqdm
 
 from models.experimental import attempt_load
 from utils.datasets import create_dataloader
-from utils.general import coco80_to_coco91_class, check_dataset, check_file, check_img_size, check_requirements, \
-    box_iou, non_max_suppression, scale_coords, xyxy2xywh, xywh2xyxy, set_logging, increment_path, colorstr
+from utils.general import (check_dataset, check_file, check_img_size, check_requirements,
+                           box_iou, non_max_suppression, scale_coords, xyxy2xywh,
+                           xywh2xyxy, set_logging, increment_path, colorstr)
 from utils.metrics import ap_per_class, ConfusionMatrix
 from utils.plots import plot_images, output_to_target, plot_study_txt
 from utils.torch_utils import select_device, time_synchronized
-import cv2
 
 
-def test(data,
-         weights=None,
-         batch_size=32,
-         imgsz=640,
-         conf_thres=0.001,
-         iou_thres=0.6,  # for NMS
-         save_json=False,
-         save_json_kpt=False,
-         single_cls=False,
-         augment=False,
-         verbose=False,
-         model=None,
-         dataloader=None,
-         save_dir=Path(''),  # for saving images
-         save_txt=False,  # for auto-labelling
-         save_txt_tidl=False,  # for auto-labelling
-         save_hybrid=False,  # for hybrid auto-labelling
-         save_conf=False,  # save auto-label confidences
-         plots=True,
-         wandb_logger=None,		 
-		 compute_loss=None,
-         half_precision=True,
-         is_coco=False,
-         opt=None,		 		 
-         tidl_load=False,
-         dump_img=False,
-         kpt_label=False,
+def match_instances(predictions, target_classes, target_boxes, threshold=0.5):
+    """Return unique (prediction, target, IoU) pairs, strongest overlap first."""
+    if not len(predictions) or not len(target_boxes):
+        return []
+    overlap = box_iou(predictions[:, :4], target_boxes)
+    valid = (overlap >= threshold) & (predictions[:, 5:6] == target_classes[None])
+    pi, ti = valid.nonzero(as_tuple=True)
+    candidates = sorted(((int(p), int(t), float(overlap[p, t])) for p, t in zip(pi, ti)),
+                        key=lambda row: row[2], reverse=True)
+    selected, used_predictions, used_targets = [], set(), set()
+    for pred, target, score in candidates:
+        if pred not in used_predictions and target not in used_targets:
+            selected.append((pred, target, score))
+            used_predictions.add(pred)
+            used_targets.add(target)
+    return selected
+
+
+def test(data, weights=None, batch_size=32, imgsz=640, conf_thres=0.001,
+         iou_thres=0.6, save_json=False, save_json_kpt=False, single_cls=False,
+         augment=False, verbose=False, model=None, dataloader=None, save_dir=Path(''),
+         save_txt=False, save_txt_tidl=False, save_hybrid=False, save_conf=False,
+         plots=True, wandb_logger=None, compute_loss=None, half_precision=True,
+         is_coco=False, opt=None, tidl_load=False, dump_img=False, kpt_label=False,
          flip_test=False):
-    # Initialize/load model and set device
     training = model is not None
-    if training:  # called by train.py
-        device = next(model.parameters()).device  # get model device
-
-    else:  # called directly
+    save_dir = Path(save_dir)
+    if not training:
+        if opt is None:
+            raise ValueError('Standalone validation requires command-line options')
         set_logging()
         device = select_device(opt.device, batch_size=batch_size)
-
-        # Directories
-        save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)  # increment run
-        (save_dir / 'labels' if save_txt or save_txt_tidl else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
-
-        # Load model
-        model = attempt_load(weights, map_location=device)  # load FP32 model
-        gs = max(int(model.stride.max()), 32)  # grid size (max stride)
-        imgsz = check_img_size(imgsz, s=gs)  # check img_size
-
-        # Multi-GPU disabled, incompatible with .half() https://github.com/ultralytics/yolov5/issues/99
-        # if device.type != 'cpu' and torch.cuda.device_count() > 1:
-        #     model = nn.DataParallel(model)
-
-    # Half
-    half = device.type != 'cpu' and half_precision  # half precision only supported on CUDA
-    if half:
-        model.half()
-
-    # Configure
+        save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok)
+        model = attempt_load(weights, map_location=device)
+    else:
+        device = next(model.parameters()).device
+    save_dir.mkdir(parents=True, exist_ok=True)
+    if save_txt or save_txt_tidl:
+        (save_dir/'labels').mkdir(exist_ok=True)
+    if isinstance(data, (str, Path)):
+        with open(data) as handle:
+            data = yaml.safe_load(handle)
+    check_dataset(data)
+    nc = 1 if single_cls else int(data['nc'])
+    head = model.model[-1]
+    nkpt = int(getattr(head, 'nkpt', 0) or 0) if kpt_label else 0
+    configured_nkpt = int(data.get('nkpt', data.get('kpt_shape', [nkpt])[0]))
+    if kpt_label and nkpt != configured_nkpt:
+        raise ValueError(f'Model has {nkpt} keypoints but data has {configured_nkpt}')
+    keypoint_names = data.get('kpt_names', data.get('keypoint_names', model.yaml.get('kpt_names', [str(i) for i in range(nkpt)])))
+    if isinstance(keypoint_names, dict):
+        keypoint_names = keypoint_names.get(0, keypoint_names.get('0', []))
+    if len(keypoint_names) != nkpt:
+        keypoint_names = [str(i) for i in range(nkpt)]
+    flip_idx = data.get('flip_idx', model.yaml.get('flip_idx', list(range(nkpt))))
+    skeleton = data.get('skeleton', model.yaml.get('skeleton'))
+    half = device.type != 'cpu' and half_precision
+    model.half() if half else model.float()
     model.eval()
-    model.model[-1].flip_test = False
-    model.model[-1].flip_index = [6, 0, 3, 1, 5, 2, 4]
-    if isinstance(data, str):
-        is_coco = data.endswith('coco.yaml') or data.endswith('coco_kpts.yaml')
-        with open(data) as f:
-            data = yaml.safe_load(f)
-    check_dataset(data)  # check
-    nc = 1 if single_cls else int(data['nc'])  # number of classes
-    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
-    niou = iouv.numel()
-
-    # Logging
-    log_imgs = 0
-    if wandb_logger and wandb_logger.wandb:
-        log_imgs = min(wandb_logger.log_imgs, 100)
-    # Dataloader
-    if not training:
-        if device.type != 'cpu':
-            model(torch.zeros(1, 3, imgsz, imgsz).to(device).type_as(next(model.parameters())))  # run once
-        task = opt.task if opt.task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt, pad=0.5, rect=True,
-                                       prefix=colorstr(f'{task}: '), tidl_load=tidl_load, kpt_label=kpt_label)[0]
-
-    seen = 0
+    gs = max(int(model.stride.max()), 32)
+    imgsz = check_img_size(imgsz, s=gs)
+    if dataloader is None:
+        task = opt.task if opt and opt.task in ('train', 'val', 'test') else 'val'
+        dataloader = create_dataloader(data[task], imgsz, batch_size, gs, opt,
+                                      pad=0.5, rect=True, prefix=colorstr(f'{task}: '),
+                                      tidl_load=tidl_load, kpt_label=kpt_label,
+                                      nkpt=nkpt, flip_idx=flip_idx)[0]
+    names = getattr(model, 'names', [str(i) for i in range(nc)])
+    names = dict(enumerate(names)) if not isinstance(names, dict) else names
     confusion_matrix = ConfusionMatrix(nc=nc)
-    names = {k: v for k, v in enumerate(model.names if hasattr(model, 'names') else model.module.names)}
-    coco91class = coco80_to_coco91_class()
-    s = ('%20s' + '%12s' * 26) % (
-    'Class', 'Images', 'Labels', 'P', 'R', 'mAP@.5','mAP@.75','mAP@.9', 'mAP@.5:.95', 'mae',
-    'pckN', 'pckRE', 'pckRL', 'pckT', 'pckLL', 'pckLE', 'pckB',
-    'pck0.02', 'pck0.04', 'pck0.06', 'pck0.08', 'pck0.1', 'pck0.12', 'pck0.14', 'pck0.16','pck0.18', 'pck0.2')
-    p, r, f1, mp, mr, map50,map75,map90, map, t0, t1 = 0., 0.,0.,0., 0., 0., 0., 0., 0., 0., 0.
+    iouv = torch.linspace(0.5, 0.95, 10, device=device)
     loss = torch.zeros(5, device=device)
-    jdict, stats, ap, ap_class, wandb_images = [], [], [], [], []
-    #jdict_kpt = [] if kpt_label else None
-    pt_mae = torch.zeros([7]).to(device)
-    pckh = 0.
-    pt_num = 0
-    pcky_Nnum = pcky_REnum = pcky_RLnum = pcky_Tnum = pcky_LLnum = pcky_LEnum = pcky_Bnum = 0
-    pckn_Nnum = pckn_REnum = pckn_RLnum = pckn_Tnum = pckn_LLnum = pckn_LEnum = pckn_Bnum = 1e-8
-    pcky02_num = pcky04_num = pcky06_num = pcky08_num = pcky10_num = pcky12_num = pcky14_num = pcky16_num = pcky18_num = pcky20_num = 0
-    pckn02_num = pckn04_num = pckn06_num = pckn08_num = pckn10_num = pckn12_num = pckn14_num = pckn16_num = pckn18_num = pckn20_num = 1e-8
-    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    stats, predictions_json = [], []
+    seen, inference_time, nms_time = 0, 0.0, 0.0
+    point_count = np.zeros(nkpt, dtype=float)
+    matched_count = np.zeros(nkpt, dtype=float)
+    point_error = np.zeros(nkpt, dtype=float)
+    point_correct = np.zeros(nkpt, dtype=float)
+    thresholds = np.arange(0.02, 0.201, 0.02)
+    pck_correct = np.zeros(len(thresholds), dtype=float)
+    for batch_i, (img, targets, paths, shapes) in enumerate(tqdm(dataloader, desc='Validating boxes and pose')):
         img = img.to(device, non_blocking=True)
-        if dump_img:
-            dst_file = os.path.join(save_dir, 'dump_img', 'images', 'val2017', Path(paths[0]).stem + '.png')
-            os.makedirs(os.path.dirname(dst_file), exist_ok=True)
-            cv2.imwrite( dst_file, img[0].numpy().transpose(1,2,0)[:,:,::-1])
-        #print(img.shape)
-        img = img.half() if half else img.float()  # uint8 to fp16/32
-        img /= 255.0  # 0 - 255 to 0.0 - 1.0
+        img = (img.half() if half else img.float()) / 255
         targets = targets.to(device)
-        nb, _, height, width = img.shape  # batch size, channels, height, width
+        nb, _, height, width = img.shape
         with torch.no_grad():
-            # Run model
-            t = time_synchronized()
-            out, train_out = model(img, augment=augment)  # inference and training outputs
+            start = time_synchronized()
+            out, train_out = model(img, augment=augment)
+            if not kpt_label:
+                out = out[..., :5+nc]
             if flip_test:
-                img_flip = torch.flip(img,[3])
-                model.model[-1].flip_test = True
-                out_flip, train_out_flip = model(img_flip, augment=augment)  # inference and training outputs
-                model.model[-1].flip_test = False
-                fuse1 = (out + out_flip)/2.0
-                out = torch.cat((out, fuse1), axis=1)
-            out = out[..., :6] if not kpt_label else out
-            targets = targets[..., :6] if not kpt_label else targets
-            t0 += time_synchronized() - t
-
-            # Compute loss
+                flipped, _ = model(img.flip(3), augment=False)
+                flipped[..., 0] = width - flipped[..., 0]
+                if nkpt:
+                    points = flipped[..., 5+nc:].reshape(*flipped.shape[:-1], nkpt, 3)
+                    points[..., 0] = width - points[..., 0]
+                    flipped[..., 5+nc:] = points[..., flip_idx, :].reshape(*flipped.shape[:-1], 3*nkpt)
+                out = torch.cat((out, flipped), 1)
+            inference_time += time_synchronized() - start
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets, training=False)[1][:-1]  # box, obj, cls
-
-            # Run NMS
-            if kpt_label:
-                num_points = (targets.shape[1]//2 - 1)
-                targets[:, 2:] *= torch.Tensor([width, height]*num_points).to(device)  # to pixels
-            else:
-                targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels
-            lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-            t = time_synchronized()
-            out = non_max_suppression(out, conf_thres, iou_thres, labels=lb, multi_label=True, agnostic=single_cls, kpt_label=kpt_label, nc=model.yaml['nc'], nkpt=model.yaml['nkpt'])
-            t1 += time_synchronized() - t
-
-        # Statistics per image
-        for si, pred in enumerate(out):
-            # if len(pred)>0 and torch.max(pred[:,4])>0.3:
-            #     with open(save_dir / 'persons.txt' , 'a') as f:
-            #         path = Path(paths[si])
-            #         f.write('./images/test2017/'+path.stem + '.jpg' + '\n')
-
-            labels = targets[targets[:, 0] == si, 1:]
-            nl = len(labels)
-            tcls = labels[:, 0].tolist() if nl else []  # target class
-            path = Path(paths[si])
+                loss += compute_loss([x.float() for x in train_out], targets, training=False)[1][:-1]
+            pixel_targets = targets.clone()
+            pixel_targets[:, 2:6] *= targets.new_tensor([width, height, width, height])
+            if nkpt:
+                pixel_targets[:, 6:] *= targets.new_tensor([width, height] * nkpt)
+            hybrid = [pixel_targets[pixel_targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []
+            start = time_synchronized()
+            output = non_max_suppression(out, conf_thres, iou_thres, labels=hybrid,
+                                         multi_label=True, agnostic=single_cls,
+                                         kpt_label=kpt_label, nc=nc, nkpt=nkpt)
+            nms_time += time_synchronized() - start
+        for image_index, pred in enumerate(output):
             seen += 1
-
-
-            if len(pred) == 0:
-                if nl:
-                    stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), tcls))
-                continue
-
-            # Predictions
+            path = Path(paths[image_index])
+            labels = pixel_targets[pixel_targets[:, 0] == image_index, 1:].clone()
+            target_classes = labels[:, 0]
+            target_boxes = xywh2xyxy(labels[:, 1:5])
+            scale_coords(img.shape[2:], target_boxes, shapes[image_index][0], shapes[image_index][1])
+            target_points = labels[:, 5:].clone()
+            if nkpt:
+                scale_coords(img.shape[2:], target_points, shapes[image_index][0], shapes[image_index][1], kpt_label=True)
+                target_points = target_points.reshape(-1, nkpt, 2)
+                target_valid = (target_points != 0).any(2)
+                point_count += target_valid.sum(0).cpu().numpy()
             if single_cls:
                 pred[:, 5] = 0
             predn = pred.clone()
-            scale_coords(img[si].shape[1:], predn[:,:4], shapes[si][0], shapes[si][1], kpt_label=False)  # native-space pred
-            if kpt_label:
-                scale_coords(img[si].shape[1:], predn[:,6:], shapes[si][0], shapes[si][1], kpt_label=kpt_label, step=3)  # native-space pred
-            # Append to text file
-            if save_txt:
-                gn = torch.tensor(shapes[si][0])[[1, 0, 1, 0]]  # normalization gain whwh
-                for *xyxy, conf, cls in predn.tolist():
-                    xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-                    line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-                    with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
-                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
-
-            if save_txt_tidl:  # Write to file in tidl dump format
-                for *xyxy, conf, cls in predn[:, :6].tolist():
-                    xyxy = torch.tensor(xyxy).view(-1).tolist()
-                    line = (conf, cls, *xyxy) if opt.save_conf else (cls, *xyxy)  # label format
-                    with open(save_dir / 'labels' / (path.stem + '.txt'), 'a') as f:
-                        f.write(('%g ' * len(line)).rstrip() % line + '\n')
-
-             # W&B logging - Media Panel Plots
-            if len(wandb_images) < log_imgs and wandb_logger.current_epoch > 0:  # Check for test operation
-                if wandb_logger.current_epoch % wandb_logger.bbox_interval == 0:
-                    box_data = [{"position": {"minX": xyxy[0], "minY": xyxy[1], "maxX": xyxy[2], "maxY": xyxy[3]},
-                                 "class_id": int(cls),
-                                 "box_caption": "%s %.3f" % (names[cls], conf),
-                                 "scores": {"class_score": conf},
-                                 "domain": "pixel"} for *xyxy, conf, cls in pred.tolist()]
-                    boxes = {"predictions": {"box_data": box_data, "class_labels": names}}  # inference-space
-                    wandb_images.append(wandb_logger.wandb.Image(img[si], boxes=boxes, caption=path.name))
-            wandb_logger.log_training_progress(predn, path, names) if wandb_logger and wandb_logger.wandb_run else None
-
-            # Append to pycocotools JSON dictionary
+            scale_coords(img.shape[2:], predn[:, :4], shapes[image_index][0], shapes[image_index][1])
+            if nkpt:
+                scale_coords(img.shape[2:], predn[:, 6:], shapes[image_index][0], shapes[image_index][1], kpt_label=True, step=3)
+            correct = torch.zeros((len(pred), len(iouv)), dtype=torch.bool, device=device)
+            # Re-match at each IoU threshold for valid box AP in multi-animal scenes.
+            for threshold_index, threshold in enumerate(iouv):
+                for pi, ti, overlap in match_instances(predn, target_classes, target_boxes, float(threshold)):
+                    correct[pi, threshold_index] = True
+            if nkpt:
+                for pi, ti, overlap in match_instances(predn, target_classes, target_boxes):
+                    valid = target_valid[ti]
+                    predicted = predn[pi, 6:].reshape(nkpt, 3)[:, :2]
+                    error = torch.linalg.vector_norm(predicted - target_points[ti], dim=1)
+                    diagonal = torch.linalg.vector_norm(target_boxes[ti, 2:] - target_boxes[ti, :2]).clamp_min(1e-9)
+                    normalized_error = error / diagonal
+                    mask = valid.cpu().numpy()
+                    point_error += error.cpu().numpy() * mask
+                    matched_count += mask
+                    point_correct += ((normalized_error <= 0.1) & valid).cpu().numpy()
+                    for index, threshold in enumerate(thresholds):
+                        pck_correct[index] += ((normalized_error <= threshold) & valid).sum().item()
+            stats.append((correct.cpu().numpy(), pred[:, 4].cpu().numpy(), pred[:, 5].cpu().numpy(), target_classes.cpu().numpy()))
+            if plots:
+                confusion_matrix.process_batch(predn[:, :6], torch.cat((target_classes[:, None], target_boxes), 1))
+            if save_txt or save_txt_tidl:
+                gain = predn.new_tensor([shapes[image_index][0][1], shapes[image_index][0][0]] * 2)
+                lines = []
+                for row in predn:
+                    normalized_box = (xyxy2xywh(row[:4][None]) / gain)[0].tolist()
+                    values = [int(row[5]), *normalized_box]
+                    if nkpt:
+                        points = row[6:].reshape(nkpt, 3).clone()
+                        points[:, 0] /= shapes[image_index][0][1]
+                        points[:, 1] /= shapes[image_index][0][0]
+                        values.extend(points.flatten().tolist())
+                    if save_conf:
+                        values.append(float(row[4]))
+                    lines.append(' '.join(f'{value:g}' for value in values))
+                (save_dir/'labels'/(path.stem+'.txt')).write_text('\n'.join(lines)+'\n')
             if save_json or save_json_kpt:
-                # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
-                image_id = int(path.stem) if path.stem.isnumeric() else path.stem
-                box = xyxy2xywh(predn[:, :4])  # xywh
-                box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-                for p, b in zip(predn.tolist(), box.tolist()):
-                    det_dict = {'image_id': image_id,
-                                'category_id': coco91class[int(p[5])] if is_coco else int(p[5]),
-                                #'bbox': [round(x, 3) for x in b],
-                                'score': round(p[4], 5)}
-                    if kpt_label:
-                        key_point = p[6:]
-                        det_dict.update({'keypoints': key_point})
-
-                    jdict.append(det_dict)
-
-            # Assign all predictions as incorrect
-            correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
-            if nl:
-                detected = []  # target indices
-                tcls_tensor = labels[:, 0]
-
-                # target boxes
-                tbox = xywh2xyxy(labels[:, 1:5])
-                scale_coords(img[si].shape[1:], tbox, shapes[si][0], shapes[si][1], kpt_label=False)  # native-space labels, kpt_label is set to False as we are dealing with boxes here
-                if kpt_label:
-                    tkpt = labels[:, 5:]
-                    scale_coords(img[si].shape[1:], tkpt, shapes[si][0], shapes[si][1], kpt_label=kpt_label)  # native-space labels
-
-                if plots:
-                    confusion_matrix.process_batch(predn, torch.cat((labels[:, 0:1], tbox), 1))
-
-                # Per target class
-                for cls in torch.unique(tcls_tensor):
-                    ti = (cls == tcls_tensor).nonzero(as_tuple=False).view(-1)  # prediction indices
-                    pi = (cls == pred[:, 5]).nonzero(as_tuple=False).view(-1)  # target indices
-
-                    # Search for detections
-                    if pi.shape[0]:
-                        # Prediction to target ious
-                        ious, i = box_iou(predn[pi, :4], tbox[ti]).max(1)  # best ious, indices
-
-                        # Append detections
-                        detected_set = set()
-                        for j in (ious > iouv[0]).nonzero(as_tuple=False):
-                            d = ti[i[j]]  # detected target
-                            if d.item() not in detected_set:
-                                detected_set.add(d.item())
-                                detected.append(d)
-                                correct[pi[j]] = ious[j] > iouv  # iou_thres is 1xn
-                                if kpt_label:
-                                    pxx = predn[j, 6::3]
-                                    pyy = predn[j, 7::3]
-                                    txx = tkpt[i[j], 0::2].to(device)
-                                   
-                                    tyy = tkpt[i[j], 1::2].to(device)
-                                    txyi = torch.bitwise_not(torch.bitwise_and(txx == 0, tyy == 0))
-                                    
-                                    mae = (torch.sqrt((pxx - txx) ** 2 + (pyy - tyy) ** 2) * txyi).mean(0)
-                                    #The hypotenuse of the groundtruth box is used as the Body length
-                                    whole_dist = torch.sqrt(
-                                        (tbox[0, 0] - tbox[0, 2]) ** 2 + (tbox[0, 1] - tbox[0, 3]) ** 2)
-                                   
-                                    pck = (torch.sqrt((pxx - txx) ** 2 + (pyy - tyy) ** 2) * txyi) / whole_dist
-
-                                    pcky_Nnum += torch.sum(torch.logical_and(pck[:, 0] < 0.1, pck[:, 0] > 0)).item()
-                                    pcky_REnum += torch.sum(torch.logical_and(pck[:, 1] < 0.1, pck[:, 1] > 0)).item()
-                                    pcky_RLnum += torch.sum(torch.logical_and(pck[:, 2] < 0.1, pck[:, 2] > 0)).item()
-                                    pcky_Tnum += torch.sum(torch.logical_and(pck[:, 3] < 0.1, pck[:, 3] > 0)).item()
-                                    pcky_LLnum += torch.sum(torch.logical_and(pck[:, 4] < 0.1, pck[:, 4] > 0)).item()
-                                    pcky_LEnum += torch.sum(torch.logical_and(pck[:, 5] < 0.1, pck[:, 5] > 0)).item()
-                                    pcky_Bnum += torch.sum(torch.logical_and(pck[:, 6] < 0.1, pck[:, 6] > 0)).item()
-                                    pckn_Nnum += torch.sum(torch.logical_and(pck[:, 0] >= 0.1, pck[:, 0] > 0)).item()
-                                    pckn_REnum += torch.sum(torch.logical_and(pck[:, 1] >= 0.1, pck[:, 1] > 0)).item()
-                                    pckn_RLnum += torch.sum(torch.logical_and(pck[:, 2] >= 0.1, pck[:, 2] > 0)).item()
-                                    pckn_Tnum += torch.sum(torch.logical_and(pck[:, 3] >= 0.1, pck[:, 3] > 0)).item()
-                                    pckn_LLnum += torch.sum(torch.logical_and(pck[:, 4] >= 0.1, pck[:, 4] > 0)).item()
-                                    pckn_LEnum += torch.sum(torch.logical_and(pck[:, 5] >= 0.1, pck[:, 5] > 0)).item()
-                                    pckn_Bnum += torch.sum(torch.logical_and(pck[:, 6] >= 0.1, pck[:, 6] > 0)).item()
-                                
-
-                                    pckn02_num += torch.sum(torch.logical_and(pck >= 0.02, pck > 0)).item()
-                                    pcky02_num += torch.sum(torch.logical_and(pck < 0.02, pck > 0)).item()
-                                    pckn04_num += torch.sum(torch.logical_and(pck >= 0.04, pck > 0)).item()
-                                    pcky04_num += torch.sum(torch.logical_and(pck < 0.04, pck > 0)).item()
-                                    pckn06_num += torch.sum(torch.logical_and(pck >= 0.06, pck > 0)).item()
-                                    pcky06_num += torch.sum(torch.logical_and(pck < 0.06, pck > 0)).item()
-                                    pckn08_num += torch.sum(torch.logical_and(pck >= 0.08, pck > 0)).item()
-                                    pcky08_num += torch.sum(torch.logical_and(pck < 0.08, pck > 0)).item()
-                                    pckn10_num += torch.sum(torch.logical_and(pck >= 0.10, pck > 0)).item()
-                                    pcky10_num += torch.sum(torch.logical_and(pck < 0.10, pck > 0)).item()
-                                    pckn12_num += torch.sum(torch.logical_and(pck >= 0.12, pck > 0)).item()
-                                    pcky12_num += torch.sum(torch.logical_and(pck < 0.12, pck > 0)).item()
-                                    pckn14_num += torch.sum(torch.logical_and(pck >= 0.14, pck > 0)).item()
-                                    pcky14_num += torch.sum(torch.logical_and(pck < 0.14, pck > 0)).item()
-                                    pckn16_num += torch.sum(torch.logical_and(pck >= 0.16, pck > 0)).item()
-                                    pcky16_num += torch.sum(torch.logical_and(pck < 0.16, pck > 0)).item()
-                                    pckn18_num += torch.sum(torch.logical_and(pck >= 0.18, pck > 0)).item()
-                                    pcky18_num += torch.sum(torch.logical_and(pck < 0.18, pck > 0)).item()
-                                    pckn20_num += torch.sum(torch.logical_and(pck >= 0.20, pck > 0)).item()
-                                    pcky20_num += torch.sum(torch.logical_and(pck < 0.20, pck > 0)).item()
-                                    pt_mae += mae
-                                    # pt_mae += (torch.sqrt((pyy - tyy) ** 2) * txyi).mean(0)
-                                    # vv = txyi[:, [0, 6]]
-                                    # pt_mae += (torch.sqrt((pxx - txx) ** 2 + (pyy - tyy) ** 2) * txyi)[:, [0, 6]].mean()  # 2 point mae
-                                    pt_num += 1
-                                if len(detected) == nl:  # all targets already located in image
-                                    break
-            # Append statistics (correct, conf, pcls, tcls)
-            stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-
-        # Plot images
-        if plots and batch_i < 3000:
-            f = save_dir / f'{path.stem}_labels.jpg'  # labels
-            #Thread(target=plot_images, args=(img, targets, paths, f, names), daemon=True).start()
-            plot_images(img, targets, paths, f, names, kpt_label=kpt_label, orig_shape=shapes[si])
-            f = save_dir / f'{path.stem}_pred.jpg'  # predictions
-            #Thread(target=plot_images, args=(img, output_to_target(out), paths, f, names), daemon=True).start()
-            plot_images(img, output_to_target(out), paths, f, names, kpt_label=kpt_label, steps=3, orig_shape=shapes[si])
-
-    # Compute statistics
-    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        p, r, ap, f1, ap_class = ap_per_class(*stats, plot=plots, save_dir=save_dir, names=names)
-        ap50,ap75,ap90, ap = ap[:, 0],ap[:, 5], ap[:, 8],ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, map50,map75, map90,map = p.mean(), r.mean(), ap50.mean(),ap75.mean(), ap90.mean(),ap.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
-    else:
-        nt = torch.zeros(1)
-    pt_num += 1e-8
-    # Print results
-
-    pf = '%20s' + '%12i' * 2 + '%12.3g' * 24
-    # pf = '%20s' + '%12i' * 2 + '%12.3g' * 10  # print format
-    print(pf % (
-    'all', seen, nt.sum(), mp, mr, map50, map75, map90, map, pt_mae.mean() / pt_num,
-    (pcky_Nnum / (pcky_Nnum + pckn_Nnum)), (pcky_REnum / (pcky_REnum + pckn_REnum)),
-    (pcky_RLnum / (pcky_RLnum + pckn_RLnum)), (pcky_Tnum / (pcky_Tnum + pckn_Tnum)),
-    (pcky_LLnum / (pcky_LLnum + pckn_LLnum)), (pcky_LEnum / (pcky_LEnum + pckn_LEnum)),
-    (pcky_Bnum / (pcky_Bnum + pckn_Bnum)),
-    (pcky02_num / (pcky02_num + pckn02_num)), (pcky04_num / (pcky04_num + pckn04_num)),
-    (pcky06_num / (pcky06_num + pckn06_num)), (pcky08_num / (pcky08_num + pckn08_num)),
-    (pcky10_num / (pcky10_num + pckn10_num)), (pcky12_num / (pcky12_num + pckn12_num)),
-    (pcky14_num / (pcky14_num + pckn14_num)), (pcky16_num / (pcky16_num + pckn16_num)),
-    (pcky18_num / (pcky18_num + pckn18_num)), (pcky20_num / (pcky20_num + pckn20_num))))
-
-    # Print results per class
-    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
-        for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c], p[i], r[i], ap50[i], ap[i]))
-
-    # Print speeds
-    t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (imgsz, imgsz, batch_size)  # tuple
-    if not training:
-        print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
-
-    # Plots
+                for row in predn:
+                    box = xyxy2xywh(row[:4][None])[0]
+                    box[:2] -= box[2:]/2
+                    item=dict(image_id=path.stem, category_id=int(row[5]), score=float(row[4]), bbox=box.tolist())
+                    if nkpt:
+                        item['keypoints']=row[6:].tolist()
+                    predictions_json.append(item)
+        if plots and batch_i < 3:
+            plot_images(img, targets, paths, save_dir/f'val_batch{batch_i}_labels.jpg', names,
+                        kpt_label=kpt_label, skeleton=skeleton)
+            plot_images(img, output_to_target(output), paths, save_dir/f'val_batch{batch_i}_pred.jpg', names,
+                        kpt_label=kpt_label, steps=3, skeleton=skeleton)
+    mp = mr = map50 = map75 = map90 = mean_ap = 0.0
+    ap_class, ap = np.array([], dtype=int), np.zeros(0)
+    if stats:
+        tp, confidence, predicted_class, target_class = [np.concatenate(values, 0) for values in zip(*stats)]
+        if tp.any():
+            precision, recall, aps, f1, ap_class = ap_per_class(tp, confidence, predicted_class, target_class,
+                                                              plot=plots, save_dir=save_dir, names=names)
+            mp, mr = float(precision.mean()), float(recall.mean())
+            map50, map75, map90 = [float(aps[:, i].mean()) for i in [0, 5, 8]]
+            ap = aps.mean(1)
+            mean_ap = float(ap.mean())
+    per_point = point_correct / np.maximum(point_count, 1)
+    pck = pck_correct / max(point_count.sum(), 1)
+    error_px = float(point_error.sum()/max(matched_count.sum(), 1))
+    report = dict(keypoints=keypoint_names, bbox_precision=mp, bbox_recall=mr, bbox_map50=map50,
+                  bbox_map50_95=mean_ap, matched_keypoint_error_px=error_px,
+                  per_keypoint_pck_at_0_1=dict(zip(keypoint_names, per_point.tolist())),
+                  labelled_points=point_count.tolist(), matched_points=matched_count.tolist(),
+                  pck_by_bbox_diagonal={f'{threshold:.2f}':float(value) for threshold,value in zip(thresholds,pck)},
+                  pck_denominator='All labelled ground-truth points, including unmatched animals',
+                  error_denominator='Labelled points on geometrically matched animals only')
+    (save_dir/'pose_metrics.json').write_text(json.dumps(report, indent=2)+'\n')
+    print(f'Images {seen}; box P {mp:.4f}, R {mr:.4f}, AP50 {map50:.4f}, AP50:95 {mean_ap:.4f}; '
+          f'keypoint error {error_px:.2f} px; PCK@0.1 {pck[4]:.4f}')
+    if save_json or save_json_kpt:
+        (save_dir/'predictions.json').write_text(json.dumps(predictions_json)+'\n')
     if plots:
         confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-        if wandb_logger and wandb_logger.wandb:
-            val_batches = [wandb_logger.wandb.Image(str(f), caption=f.name) for f in sorted(save_dir.glob('test*.jpg'))]
-            wandb_logger.log({"Validation": val_batches})
-    if wandb_images:
-        wandb_logger.log({"Bounding Box Debugger/Images": wandb_images})
-
-    # Save JSON
-    if save_json or save_json_kpt and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
-        with open(pred_json, 'w') as f:
-            json.dump(jdict, f)
-        if save_json:
-            anno_json = '../coco/annotations/instances_val2017.json'  # annotations json
-            print('\nEvaluating pycocotools mAP... saving %s...' % pred_json)
-            try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-                from pycocotools.coco import COCO
-                from pycocotools.cocoeval import COCOeval
-
-                anno = COCO(anno_json)  # init annotations api
-                pred = anno.loadRes(pred_json)  # init predictions api
-                eval = COCOeval(anno, pred, 'bbox')
-                if is_coco:
-                    eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.img_files]  # image IDs to evaluate
-                eval.evaluate()
-                eval.accumulate()
-                eval.summarize()
-                map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
-            except Exception as e:
-                print(f'pycocotools unable to run: {e}')
-
-        elif save_json_kpt:
-            anno_json = '../coco/annotations/person_keypoints_val2017.json'  # annotations json
-            print('\nEvaluating xtcocotools mAP... saving %s...' % pred_json)
-
-            try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-                # from pycocotools.coco import COCO
-                # from pycocotools.cocoeval import COCOeval
-
-                from xtcocotools.coco import COCO
-                from xtcocotools.cocoeval import COCOeval
-
-                anno = COCO(anno_json)  # init annotations api
-                pred = anno.loadRes(pred_json)  # init predictions api
-                eval = COCOeval(anno, pred, 'keypoints', use_area=True) #,
-                if is_coco:
-                    eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.img_files]  # image IDs to evaluate
-                eval.evaluate()
-                eval.accumulate()
-                eval.summarize()
-                map, map50 = eval.stats[:2]  # update results (mAP@0.5:0.95, mAP@0.5)
-            except Exception as e:
-                print(f'xtcocotools unable to run: {e}')
-
-    # Return results
-    model.float()  # for training
-    if not training:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        print(f"Results saved to {save_dir}{s}")
-    maps = np.zeros(nc) + map
-    for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map50,map75,map90 ,map, (pt_mae.mean()/pt_num).cpu().tolist(),(pcky_Nnum / (pcky_Nnum + pckn_Nnum)), (pcky_REnum / (pcky_REnum + pckn_REnum)), (pcky_RLnum / (pcky_RLnum + pckn_RLnum)),(pcky_Tnum / (pcky_Tnum + pckn_Tnum)), (pcky_LLnum / (pcky_LLnum + pckn_LLnum)), (pcky_LEnum / (pcky_LEnum + pckn_LEnum)), (pcky_Bnum / (pcky_Bnum + pckn_Bnum)),(pcky02_num / (pcky02_num + pckn02_num)),(pcky04_num / (pcky04_num + pckn04_num)),(pcky06_num / (pcky06_num + pckn06_num)),(pcky08_num / (pcky08_num + pckn08_num)),(pcky10_num / (pcky10_num + pckn10_num)),(pcky12_num / (pcky12_num + pckn12_num)),(pcky14_num / (pcky14_num + pckn14_num)),(pcky16_num / (pcky16_num + pckn16_num)),(pcky18_num / (pcky18_num + pckn18_num)),(pcky20_num / (pcky20_num + pckn20_num)), *((loss.cpu() / len(dataloader)).tolist())), maps, t
+    model.float()
+    maps = np.zeros(nc) + mean_ap
+    for index, category in enumerate(ap_class):
+        maps[category] = ap[index]
+    times = tuple(value/max(seen,1)*1000 for value in [inference_time,nms_time,inference_time+nms_time]) + (imgsz,imgsz,batch_size)
+    results = (mp,mr,map50,map75,map90,mean_ap,error_px,*per_point.tolist(),*pck.tolist(),
+               *((loss.cpu()/max(len(dataloader),1)).tolist()))
+    return results, maps, times
 
 
 if __name__ == '__main__':
@@ -469,7 +271,8 @@ if __name__ == '__main__':
     opt.save_json_kpt |= opt.data.endswith('coco_kpts.yaml')
     opt.data = check_file(opt.data)  # check file
     print(opt)
-    check_requirements(exclude=('tensorboard', 'pycocotools', 'thop'))
+    # Dependencies are managed explicitly via requirements-rat.txt; never install
+    # or update the user's environment as a side effect of evaluation.
 
     if opt.task in ('train', 'val', 'test'):  # run normally
         test(opt.data,

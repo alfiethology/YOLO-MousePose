@@ -1,5 +1,10 @@
 # YOLO-MousePose: Mouse Pose estimation model
 
+**RatCam1 adaptation:** see [RAT_SETUP.md](RAT_SETUP.md) for the six-landmark rat
+schema, prepared dataset, weight-transfer limitations, and training commands.
+See [CHANGELOG.md](CHANGELOG.md) for the adaptation history and verification.
+The original mouse model configurations and documentation remain below.
+
 ## Introduction
 English | [简体中文](/README_zh-CN.md)
 

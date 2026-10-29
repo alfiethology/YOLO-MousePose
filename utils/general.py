@@ -9,6 +9,7 @@ import random
 import re
 import subprocess
 import time
+import tempfile
 from itertools import repeat
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
@@ -268,7 +269,7 @@ def labels_to_class_weights(labels, nc=80):
 
 def labels_to_image_weights(labels, nc=80, class_weights=np.ones(80)):
     # Produces image weights based on class_weights and image contents
-    class_counts = np.array([np.bincount(x[:, 0].astype(np.int), minlength=nc) for x in labels])
+    class_counts = np.array([np.bincount(x[:, 0].astype(int), minlength=nc) for x in labels])
     image_weights = (class_weights.reshape(1, nc) * class_counts).sum(1)
     # index = random.choices(range(n), weights=image_weights, k=1)  # weight image sample
     return image_weights
@@ -386,14 +387,17 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None, kpt_label=False
         coords[:, [1, 3]] -= pad[1]  # y padding
         coords[:, [0, 2]] /= gain
         coords[:, [1, 3]] /= gain
-        clip_coords(coords[0:4], img0_shape)
+        clip_coords(coords, img0_shape)
         #coords[:, 0:4] = coords[:, 0:4].round()
     else:
+        missing = (coords[:, 0::step] == 0) & (coords[:, 1::step] == 0)
         coords[:, 0::step] -= pad[0]  # x padding
         coords[:, 1::step] -= pad[1]  # y padding
         coords[:, 0::step] /= gain
         coords[:, 1::step] /= gain
         clip_coords(coords, img0_shape, step=step)
+        coords[:, 0::step][missing] = 0
+        coords[:, 1::step][missing] = 0
         #coords = coords.round()
     return coords
 
@@ -484,139 +488,81 @@ def wh_iou(wh1, wh2):
 
 def non_max_suppression(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
                         labels=(), kpt_label=False, nc=None, nkpt=None):
-    """Runs Non-Maximum Suppression (NMS) on inference results
-
-    Returns:
-         list of detections, on (n,6) tensor per image [xyxy, conf, cls]
-    """
-
-    kps = 7
-    if nc is None:
-        nc = prediction.shape[2] - 5  if not kpt_label else prediction.shape[2] - kps *3 -5 # number of classes
-    xc = prediction[..., 4] > conf_thres  # candidates
-
-    # Settings
-    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
-    max_det = 300  # maximum number of detections per image
-    max_nms = 30000  # maximum number of boxes into torchvision.ops.nms()
-    time_limit = 10.0  # seconds to quit after
-    redundant = True  # require redundant detections
-    multi_label &= nc > 1  # multiple labels per box (adds 0.5ms/img)
-    merge = False  # use merge-NMS
-
-    t = time.time()
-    output = [torch.zeros((0,6), device=prediction.device)] * prediction.shape[0]
-    for xi, x in enumerate(prediction):  # image index, image inference
-        # Apply constraints
-        # x[((x[..., 2:4] < min_wh) | (x[..., 2:4] > max_wh)).any(1), 4] = 0  # width-height
-        x = x[xc[xi]]  # confidence
-
-        # Cat apriori labels if autolabelling
-        if labels and len(labels[xi]):
-            l = labels[xi]
-            v = torch.zeros((len(l), nc + 5), device=x.device)
-            v[:, :4] = l[:, 1:5]  # box
-            v[:, 4] = 1.0  # conf
-            v[range(len(l)), l[:, 0].long() + 5] = 1.0  # cls
-            x = torch.cat((x, v), 0)
-
-        # If none remain process next image
-        if not x.shape[0]:
+    """NMS preserving the keypoint triplets belonging to each selected animal."""
+    if kpt_label:
+        if nkpt is None:
+            nkpt = (prediction.shape[2] - 5 - (nc or 1)) // 3
+        nc = nc or prediction.shape[2] - 5 - 3 * nkpt
+    else:
+        nkpt, nc = 0, nc or prediction.shape[2] - 5
+    if nc < 1 or prediction.shape[2] != 5 + nc + 3 * nkpt:
+        raise ValueError('Prediction width disagrees with nc/nkpt')
+    candidates = prediction[..., 4] > conf_thres
+    output = [prediction.new_zeros((0, 6 + 3 * nkpt)) for _ in prediction]
+    for image_index, raw in enumerate(prediction):
+        x = raw[candidates[image_index]].clone()
+        if labels and len(labels[image_index]):
+            ground_truth = labels[image_index]
+            extra = x.new_zeros((len(ground_truth), 5 + nc + 3 * nkpt))
+            extra[:, :4], extra[:, 4] = ground_truth[:, 1:5], 1.0
+            extra[torch.arange(len(extra)), ground_truth[:, 0].long() + 5] = 1.0
+            if nkpt:
+                points = ground_truth[:, 5:].reshape(-1, nkpt, 2)
+                triplets = extra[:, 5+nc:].reshape(-1, nkpt, 3)
+                triplets[..., :2] = points
+                triplets[..., 2] = (points != 0).any(-1).float()
+            x = torch.cat((x, extra), 0)
+        if not len(x):
             continue
-
-        # Compute conf
-        x[:, 5:5+nc] *= x[:, 4:5]  # conf = obj_conf * cls_conf
-
-        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
-        box = xywh2xyxy(x[:, :4])
-
-        # Detections matrix nx6 (xyxy, conf, cls)
-        if multi_label:
-            i, j = (x[:, 5:] > conf_thres).nonzero(as_tuple=False).T
-            x = torch.cat((box[i], x[i, j + 5, None], j[:, None].float()), 1)
-        else:  # best class only
-            if not kpt_label:
-                conf, j = x[:, 5:].max(1, keepdim=True)
-                x = torch.cat((box, conf, j.float()), 1)[conf.view(-1) > conf_thres]
-            else:
-                kpts = x[:, 6:]
-                conf, j = x[:, 5:6].max(1, keepdim=True)
-                x = torch.cat((box, conf, j.float(), kpts), 1)[conf.view(-1) > conf_thres]
-
-
-        # Filter by class
+        class_confidence = x[:, 5:5+nc] * x[:, 4:5]
+        boxes = xywh2xyxy(x[:, :4])
+        keypoints = x[:, 5+nc:]
+        if multi_label and nc > 1:
+            rows, categories = (class_confidence > conf_thres).nonzero(as_tuple=True)
+            selected = torch.cat((boxes[rows], class_confidence[rows, categories, None],
+                                  categories[:, None].float(), keypoints[rows]), 1)
+        else:
+            confidence, category = class_confidence.max(1, keepdim=True)
+            selected = torch.cat((boxes, confidence, category.float(), keypoints), 1)
+            selected = selected[confidence[:, 0] > conf_thres]
         if classes is not None:
-            x = x[(x[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
-
-        # Apply finite constraint
-        # if not torch.isfinite(x).all():
-        #     x = x[torch.isfinite(x).all(1)]
-
-        # Check shape
-        n = x.shape[0]  # number of boxes
-        if not n:  # no boxes
+            selected = selected[(selected[:, 5:6] == torch.tensor(classes, device=x.device)).any(1)]
+        selected = selected[torch.isfinite(selected).all(1)]
+        if not len(selected):
             continue
-        elif n > max_nms:  # excess boxes
-            x = x[x[:, 4].argsort(descending=True)[:max_nms]]  # sort by confidence
-
-        # Batched NMS
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        boxes, scores = x[:, :4] + c, x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        if i.shape[0] > max_det:  # limit detections
-            i = i[:max_det]
-        if merge and (1 < n < 3E3):  # Merge NMS (boxes merged using weighted mean)
-            # update boxes as boxes(i,4) = weights(i,n) * boxes(n,4)
-            iou = box_iou(boxes[i], boxes) > iou_thres  # iou matrix
-            weights = iou * scores[None]  # box weights
-            x[i, :4] = torch.mm(weights, x[:, :4]).float() / weights.sum(1, keepdim=True)  # merged boxes
-            if redundant:
-                i = i[iou.sum(1) > 1]  # require redundancy
-
-        output[xi] = x[i]
-        if (time.time() - t) > time_limit:
-            print(f'WARNING: NMS time limit {time_limit}s exceeded')
-            break  # time limit exceeded
-
+        selected = selected[selected[:, 4].argsort(descending=True)[:30000]]
+        offsets = selected[:, 5:6] * (0 if agnostic else 4096)
+        keep = torchvision.ops.nms(selected[:, :4] + offsets, selected[:, 4], iou_thres)[:300]
+        output[image_index] = selected[keep]
     return output
 
 
 def non_max_suppression_export(prediction, conf_thres=0.25, iou_thres=0.45, classes=None, agnostic=False, multi_label=False,
-                        kpt_label=True, nc=None, labels=()):
-    """Runs Non-Maximum Suppression (NMS) on inference results
+                               kpt_label=True, nc=None, labels=(), nkpt=None):
+    return non_max_suppression(prediction, conf_thres, iou_thres, classes, agnostic,
+                               multi_label, labels, kpt_label, nc, nkpt)
 
-    Returns:
-         list of detections, on (n,6) tensor per image [xyxy, conf, cls]
-    """
-    kps = 7
-    if nc is None:
-        nc = prediction.shape[2] - 5  if not kpt_label else prediction.shape[2] - kps * 3 -5  # number of classes
 
-    min_wh, max_wh = 2, 4096  # (pixels) minimum and maximum box width and height
-    xc = prediction[..., 4] > conf_thres  # candidates
-    output = [torch.zeros((0, kps * 3 + 6), device=prediction.device)] * prediction.shape[0]
-    for xi, x in enumerate(prediction):  # image index, image inference
-        x = x[xc[xi]]  # confidence
-        # Compute conf
-        cx, cy, w, h = x[:,0:1], x[:,1:2], x[:,2:3], x[:,3:4]
-        obj_conf = x[:, 4:5]
-        cls_conf = x[:, 5:5+nc]
-        kpts = x[:, 6:]
-        cls_conf = obj_conf * cls_conf  # conf = obj_conf * cls_conf
-        # Box (center x, center y, width, height) to (x1, y1, x2, y2)
-        box = xywh2xyxy_export(cx, cy, w, h)
-        conf, j = cls_conf.max(1, keepdim=True)
-        x = torch.cat((box, conf, j.float(), kpts), 1)[conf.view(-1) > conf_thres]
-        c = x[:, 5:6] * (0 if agnostic else max_wh)  # classes
-        boxes, scores = x[:, :4] +c , x[:, 4]  # boxes (offset by class), scores
-        i = torchvision.ops.nms(boxes, scores, iou_thres)  # NMS
-        output[xi] = x[i]
-    return output
+def atomic_torch_save(checkpoint, destination):
+    """Publish a complete checkpoint without exposing an in-progress .pt file."""
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=destination.parent, prefix='.' + destination.name + '.', suffix='.tmp', delete=False) as handle:
+            temporary = Path(handle.name)
+            torch.save(checkpoint, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
-    x = torch.load(f, map_location=torch.device('cpu'))
+    x = torch.load(f, map_location=torch.device('cpu'), weights_only=False)
     if x.get('ema'):
         x['model'] = x['ema']  # replace model with ema
     for k in 'optimizer', 'training_results', 'wandb_id', 'ema', 'updates':  # keys
@@ -625,7 +571,7 @@ def strip_optimizer(f='best.pt', s=''):  # from utils.general import *; strip_op
     x['model'].half()  # to FP16
     for p in x['model'].parameters():
         p.requires_grad = False
-    torch.save(x, s or f)
+    atomic_torch_save(x, s or f)
     mb = os.path.getsize(s or f) / 1E6  # filesize
     print(f"Optimizer stripped from {f},{(' saved as %s,' % s) if s else ''} {mb:.1f}MB")
 
