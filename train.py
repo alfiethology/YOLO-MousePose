@@ -135,9 +135,8 @@ def train(hyp, opt, device, tb_writer=None):
             v.requires_grad = False
 
     # Optimizer
-    nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
-    hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
+    accumulate = opt.accumulate
+    nbs = total_batch_size * accumulate
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
@@ -277,6 +276,7 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
+    optimizer_steps = 0
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
 
@@ -342,13 +342,14 @@ def train(hyp, opt, device, tb_writer=None):
                     loss *= 4.
 
             # Backward
-            scaler.scale(loss).backward()
+            scaler.scale(loss / accumulate).backward()
 
             # Optimize
-            if ni % accumulate == 0:
+            if (i + 1) % accumulate == 0 or i + 1 == nb:
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
                 optimizer.zero_grad()
+                optimizer_steps += 1
                 if ema:
                     ema.update(model)
 
@@ -441,8 +442,8 @@ def train(hyp, opt, device, tb_writer=None):
                 with metrics_file.open('a', newline='') as handle:
                     writer = csv.writer(handle)
                     if new_file:
-                        writer.writerow(['epoch', *tags])
-                    writer.writerow([epoch + 1, *values])
+                        writer.writerow(['epoch', *tags, 'optimizer_steps'])
+                    writer.writerow([epoch + 1, *values, optimizer_steps])
 
             for x, tag in zip(values, tags):
                 if tb_writer:
@@ -531,10 +532,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='weights/yolobackbone.pth', help='initial weights path')
     parser.add_argument('--cfg', type=str, default='models/hub/YOLO-RatPose-T.yaml', help='model.yaml path')
-    parser.add_argument('--data', type=str, default='data/rat_kpts.yaml', help='data.yaml path')
+    parser.add_argument('--data', type=str, default='data/rat_fullframes_kpts.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.rat.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=500)
     parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
+    parser.add_argument('--accumulate', type=int, default=1, help='minibatches per optimizer step; 1 suits the small rat crop dataset')
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
@@ -568,6 +570,8 @@ if __name__ == '__main__':
     parser.add_argument('--val-period', type=int, default=1, help='validate every N epochs and always on final epoch')
     parser.add_argument('--best-metric', choices=['pck', 'bbox_map'], default='pck', help='select best checkpoint by pose PCK@0.1 or box AP50:95')
     opt = parser.parse_args()
+    if opt.accumulate < 1:
+        parser.error('--accumulate must be at least 1')
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1

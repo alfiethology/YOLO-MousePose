@@ -1,0 +1,48 @@
+# Same v3 full-frame image/TXT files as the YOLO26 comparison. No new export.
+train: /home/or22503/OneDrive/vikki_rat_project/models/datasets/pose/ratcam1_rat6_four_rats_fullframes_v3/images/train
+val: /home/or22503/OneDrive/vikki_rat_project/models/datasets/pose/ratcam1_rat6_four_rats_fullframes_v3/images/val
+nc: 1
+names:
+- rat
+kpt_shape:
+- 6
+- 3
+flip_idx:
+- 0
+- 2
+- 1
+- 3
+- 4
+- 5
+kpt_names: &id001
+- snout
+- left_ear
+- right_ear
+- neck_base
+- body_centre
+- tail_base
+kpt_oks_sigmas:
+- 0.16666666666666666
+- 0.16666666666666666
+- 0.16666666666666666
+- 0.16666666666666666
+- 0.16666666666666666
+- 0.16666666666666666
+nkpt: 6
+keypoint_names: *id001
+skeleton:
+- - 4
+  - 3
+- - 3
+  - 1
+- - 1
+  - 0
+- - 2
+  - 0
+- - 2
+  - 3
+- - 5
+  - 4
+review_required: false
+preparation_manifest: /home/or22503/OneDrive/vikki_rat_project/models/datasets/pose/ratcam1_rat6_four_rats_fullframes_v3/manifest.csv
+selection_policy: Exactly four rat skeletons; explicit pose exclusions omitted

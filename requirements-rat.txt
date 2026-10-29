@@ -12,3 +12,5 @@ seaborn>=0.12
 matplotlib>=3.6
 tqdm>=4.64
 requests>=2.28
+# Required only to screen/export crops with the separate trained BB rat detector.
+ultralytics>=8.4

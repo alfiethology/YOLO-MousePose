@@ -5,6 +5,47 @@ unreleased change to the original YOLO-MousePose project.
 
 ## Unreleased — 2026-10-29
 
+### Training failure diagnosis and fixes
+
+- Diagnosed visible rats losing their entire pose target during affine
+  augmentation: the inherited candidate filter required over 80% of the
+  transformed box to remain in the image. In a reproducible 352-sample replay,
+  88 augmented crops lost their target despite a large rat remaining visible.
+- Retained clipped pose boxes for visible animals and masked only landmarks
+  outside the image. Fully out-of-frame or negligible boxes are still removed.
+  The same replay produced zero target losses after the fix.
+- Added three regression tests for partially clipped animals, fully outside
+  animals, and zoomed pose crops retaining boxes while masking outside points.
+- Made gradient accumulation explicit, defaulting to one optimizer update per
+  minibatch for the small crop dataset. Remaining gradients are applied at the
+  end of each epoch instead of being discarded. Metrics now record optimizer
+  update counts.
+- Revised the initial crop-training recipe to LR 0.001, 10-degree rotations,
+  translation 0.05 and scale variation 0.15. The available checkpoint only
+  partially initializes the network; the earlier fine-tuning recipe learned
+  too slowly in the presence of corrupted augmented targets.
+- Preserved the existing 10/100-epoch runs and saved diagnostic evidence under
+  `../logs/ratpose_training_debug_20261029/`.
+
+### Neighbour-screened crop dataset
+
+- Added `data/dataset/prepare_rat_crops.py` to generate one pose-labelled animal
+  per crop, with 10-pixel padding and translated six-point coordinates/visibility.
+- Screened using reviewed master BBs on matching frames, the verified generic
+  BB rat detector elsewhere, and all other pose boxes as additional evidence.
+- Held out crops with neighbouring boxes entering the crop, unmatched focal
+  boxes, or existing per-pose exclusions. Exclusions apply per animal rather than
+  discarding unrelated isolated animals from the same frame.
+- Exported **88 training and 21 validation crops**, retaining source-recording
+  split assignments from the rat/ID datasets where available.
+- Added an overview image, complete accepted/excluded preview sheets, a local
+  preview index and detailed screening/provenance manifests.
+- Updated the training defaults to `data/rat_crops_kpts.yaml`. The earlier
+  incomplete full-frame export remains available explicitly.
+- Added regression checks for crop intersections, focal-box matching, labelled
+  landmarks beyond the BB and missing-point masking. Source annotations remain
+  unchanged; automatic screening is not a claim of perfect neighbour detection.
+
 ### Rat skeleton and model configuration
 
 - Added six-point rat configurations for Tiny, Small, Medium and Large models:
@@ -121,3 +162,21 @@ unreleased change to the original YOLO-MousePose project.
   No long rat-pose training run was started as part of this adaptation.
 - The changed output layout and evaluation definitions mean results must not be
   equated directly with the original paper's reported scores.
+
+## 2026-10-29 — retain neighbouring rats in pose crops
+
+- Add `prepare_rat_crowded_crops.py`: retain close rats and export all known intersecting skeletons or box-only targets, masking unavailable and out-of-crop landmarks.
+- Regenerate from 129 frames / 357 skeletons: 247 train and 93 validation focal crops; respect 17 existing exclusions.
+- Keep recording groups separate and reuse shared rat/ID assignments. Switch the default crop YAML to the new export; preserve source annotations and the isolated export.
+
+## 2026-10-29 — correct neighbour fragments in crop export
+
+- Audit confirms all 129 sources are full 1296x972 frames and all 340 v2 crops reconstruct exactly from those sources; no double cropping.
+- Expand crops to include complete known neighbouring boxes and labelled points, iterating through connected neighbours. The v2 export could supervise tiny neighbour fragments (106 of 211 neighbour occurrences contained less than 20% of the source box).
+- Export v3 with 186 train / 61 validation crops after removing 93 duplicate group crops; keep all 17 explicit pose exclusions. Point the default YAML at v3 and preserve v2 and its training run.
+
+## 2026-10-29 — four-rat full-frame v3 comparison
+
+- Add `data/rat_fullframes_kpts.yaml` pointing directly to the same 40 train / 18 validation full-frame image and TXT files as YOLO26m. Adapt keypoint-name metadata to the fork.
+- Default `train_rat.py` to full-frame v3, 928 pixels, 150 epochs and a distinct run name; retain batch 8, augmentation, cosine decay and one optimizer update per batch. Reject unsupported automatic batch sizes clearly.
+- Give MousePose `.mousepose.cache` files to avoid incompatible Torch/NumPy label cache collisions with Ultralytics on shared data. Preserve Ultralytics caches and all source images/labels.

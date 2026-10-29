@@ -15,7 +15,59 @@ Skeleton edges follow `../skeleton_templates/rat.skeleton.json`. The original
 seven-point mouse model YAMLs are retained; rat models are separate
 `models/hub/YOLO-RatPose-{T,S,M,L}.yaml` files.
 
-## Prepared data
+## Current default: four-rat full frames, v3
+
+`train_rat.py` uses `data/rat_fullframes_kpts.yaml`: the **exact same image and
+TXT label files** as the latest YOLO26m full-frame experiment, at
+`../models/datasets/pose/ratcam1_rat6_four_rats_fullframes_v3/`.
+There are **40 training frames (160 rats)** and **18 validation frames (72 rats)**.
+Recordings remain separated using the existing split. Nine frames with explicit
+pose-exclusion flags were already omitted by the export. The original annotations
+and all previous datasets are unchanged. No cropping or resplitting is performed.
+
+From the project root:
+
+```bash
+conda activate yolo-env
+python YOLO-MousePose/train_rat.py --epochs 150 --name rat6_fullframes_v3_150e
+```
+
+Defaults: 928-pixel input, batch 8, one update per minibatch, AdamW LR 0.001,
+cosine decay, augmentation, six rat points, existing Tiny model/backbone weights.
+The fork requires a positive batch size; Ultralytics automatic batch `-1` is not
+supported here. Results go to `runs/rat_pose/rat6_fullframes_v3_150e/` inside this
+fork. Use `--dry-run` to inspect the command. To repeat the previous crop experiment,
+pass `--data YOLO-MousePose/data/rat_crops_kpts.yaml --img-size 640` explicitly.
+
+MousePose uses separate `<split>.mousepose.cache` label caches so its Torch cache
+format cannot collide with Ultralytics' `<split>.cache` files in the shared export.
+The dataset metadata uses a list of six keypoint names for MousePose's metric CSV.
+Its PCK and the YOLO26 pose OKS mAP are different metrics; the two models also use
+different losses, capacity and starting weights, so compare predictions as well.
+
+## Previous crop experiment: pose crops retaining neighbours
+
+The previous crop configuration `data/rat_crops_kpts.yaml` points to
+`../models/datasets/pose/ratcam1_mousepose_rat6_crowded_crops_v3/`.
+The export uses 129 full frames / 357 skeletons: **186 training crops and 61
+validation crops**. Only 17 explicitly excluded poses are omitted as focal crops.
+Nearby rats are retained, including 82 crops with known neighbours. Crops expand
+to include whole known neighbours; 93 identical group crops are deduplicated.
+
+Every saved skeleton intersecting a crop contributes its whole bounding box and
+available in-crop landmarks. Box-only neighbours contribute detection targets
+with all pose landmarks unavailable. Explicitly excluded poses can contribute
+boxes, but their pose points are not supervised. Unknown animals lacking any
+annotation can remain unlabelled; inspect the previews. The preview overlays show
+focal landmarks, while the TXT files also include known neighbours.
+
+Source recordings stay together using the shared rat/ID split and deterministic
+fallback assignments. Sources are unchanged. Regenerate to a new output directory
+with `data/dataset/prepare_rat_crowded_crops.py --output <new-directory>`.
+Open `preview_overview.jpg` and `previews/` in the dataset folder.
+The earlier isolated `ratcam1_mousepose_rat6_crops_v1` export is preserved.
+
+## Earlier full-frame candidate export
 
 `data/rat_kpts.yaml` points to the exported dataset at
 `../models/datasets/pose/ratcam1_mousepose_rat6_v1/`:
@@ -79,24 +131,33 @@ neck-base output remains newly initialized.
 Use the existing `yolo-env`; no replacement of its PyTorch/CUDA packages is needed.
 The launcher resolves paths from the fork, so it works when invoked from elsewhere.
 
-After source completeness review, export reviewed data and point `--data` at its
-YAML. For a knowingly provisional experiment with the current candidate data:
+For a shorter 30-epoch trial using the default four-rat full-frame dataset:
 
 ```bash
 /home/or22503/miniconda3/envs/yolo-env/bin/python \
   /home/or22503/OneDrive/vikki_rat_project/YOLO-MousePose/train_rat.py \
-  --epochs 80 --allow-incomplete-review
+  --epochs 30 --name rat6_fullframes_v3_30e
 ```
 
-The acknowledgement is needed because the source files explicitly retain their
-pending-review flag. Without it, training stops with a clear message. No long
-training has been started as part of adapting this fork.
+If you explicitly choose the earlier full-frame candidate YAML with `--data`,
+`--allow-incomplete-review` is still needed because those source files retain
+their pending completeness-review flag. No long training was started during
+crop preparation.
 
-Defaults are Tiny, AdamW, initial learning rate 0.0003, cosine decay, three warmup
-epochs, batch 8, image size 640 and GPU 0. Use `--dry-run` to print the command,
+Defaults are Tiny, AdamW, initial learning rate 0.001, cosine decay, three warmup
+epochs, batch 8, image size 928 and GPU 0. Use `--dry-run` to print the command,
 `--cfg` to choose another rat model, `--weights` to choose an available matching
 checkpoint, and `--data` to select a new export. See `data/hyp.rat.yaml` for the
 complete initial recipe; it is a starting point, not a tuned result.
+
+Training now updates on every minibatch by default (`--accumulate 1`). With only
+11 minibatches per epoch, the inherited nominal-batch-64 accumulation performed
+very few updates and discarded some unfinished accumulated gradients at epoch
+boundaries. `metrics.csv` records the optimizer-step count. The affine filter
+also retains the clipped box of a visible rat instead of deleting its entire
+target when a tight crop is zoomed beyond the canvas. Individual points outside
+the canvas are masked, so some partial skeletons in training previews are normal;
+fully visible animals with no target are not.
 
 `best.pt` is selected using pose PCK at 0.1 of the ground-truth box diagonal,
 including missed animals in its denominator. Direct `train.py --best-metric

@@ -405,7 +405,9 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
         # Check cache
         self.label_files = img2label_paths(self.img_files)  # labels
-        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
+        # Ultralytics uses NumPy for <split>.cache; this fork uses torch.save.
+        # Separate paths let both trainers share the same image/label export.
+        cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.mousepose.cache')
         if cache_path.is_file():
             cache, exists = torch.load(cache_path, weights_only=False), True  # trusted local label cache
             if cache.get('hash') != get_hash(self.label_files + self.img_files) or cache.get('version') != 0.2 or cache.get('nkpt') != self.nkpt:  # changed
@@ -1037,8 +1039,12 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
                 xy_kpts[:, list(range(1, kps*2, 2))] = y_kpts
 
         # filter candidates
+        # Tight pose crops are frequently zoomed beyond the canvas. Retain the
+        # visible animal's clipped box rather than deleting its entire target
+        # when less than 80% remains in view. Landmark coordinates outside the
+        # canvas have already been masked above.
         i = box_candidates(box1=targets[:, 1:5].T * s, box2=new.T, area_thr=0.01, ar_thr=50, width=width, height=height,
-                           ol_thr=0.8)
+                           ol_thr=0.01 if kpt_label else 0.8)
 
         new[:, [0, 2]] = new[:, [0, 2]].clip(0, width)
         new[:, [1, 3]] = new[:, [1, 3]].clip(0, height)
@@ -1053,14 +1059,15 @@ def random_perspective(img, targets=(), segments=(), degrees=10, translate=.1, s
 def box_candidates(box1, box2, width, height, wh_thr=2, ar_thr=20, area_thr=0.1, eps=1e-16, ol_thr=0.4):  # box1(4,n), box2(4,n)
     # Compute candidate boxes: box1 before augment, box2 after augment, wh_thr (pixels), aspect_ratio_thr, area_ratio
     w1, h1 = box1[2] - box1[0], box1[3] - box1[1]
-    w2, h2 = box2[2] - box2[0], box2[3] - box2[1]
-    ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))  # aspect ratio
+    original_area = np.maximum(0, box2[2]-box2[0]) * np.maximum(0, box2[3]-box2[1])
     x21 = np.clip(box2[0], 0, width)
-    x22 = np.clip(box2[2], -1, width)
+    x22 = np.clip(box2[2], 0, width)
     y21 = np.clip(box2[1], 0, height)
-    y22 = np.clip(box2[3], -1, height)
-    ia = (x22 - x21) * (y22 - y21)
-    oa = w2 * h2
+    y22 = np.clip(box2[3], 0, height)
+    w2, h2 = np.maximum(0, x22-x21), np.maximum(0, y22-y21)
+    ar = np.maximum(w2 / (h2 + eps), h2 / (w2 + eps))
+    ia = w2 * h2
+    oa = original_area
     return (w2 > wh_thr) & (h2 > wh_thr) & (w2 * h2 / (w1 * h1 + eps) > area_thr) &\
         (ar < ar_thr) & (ia / (oa + eps) > ol_thr) # candidates
 
